@@ -51,22 +51,34 @@ def calculate_shift_metrics(df, target_vars):
                 'mean', 'median', 'std', 'count'
             ]).reset_index()
             
-            # Calculate year-over-year changes
-            if len(yearly_stats) > 1:
-                yearly_stats['YoY_Mean_Change'] = yearly_stats['mean'].pct_change() * 100
-                yearly_stats['YoY_Median_Change'] = yearly_stats['median'].pct_change() * 100
-                
-                # Recent vs baseline comparison (last year vs first year)
-                recent_mean = yearly_stats['mean'].iloc[-1]
-                baseline_mean = yearly_stats['mean'].iloc[0]
-                total_change = ((recent_mean - baseline_mean) / baseline_mean) * 100 if baseline_mean != 0 else 0
+                # Calculate year-over-year changes with proper handling
+                total_change = 0
+                if len(yearly_stats) > 1:
+                    yearly_stats['YoY_Mean_Change'] = yearly_stats['mean'].pct_change() * 100
+                    yearly_stats['YoY_Median_Change'] = yearly_stats['median'].pct_change() * 100
+                    
+                    # Recent vs baseline comparison (last year vs first year)
+                    recent_mean = yearly_stats['mean'].iloc[-1]
+                    baseline_mean = yearly_stats['mean'].iloc[0]
+                    
+                    if not (pd.isna(recent_mean) or pd.isna(baseline_mean)) and baseline_mean != 0:
+                        total_change = ((recent_mean - baseline_mean) / baseline_mean) * 100
                 
                 # Trend analysis using linear regression
                 years = yearly_stats['Year'].values
                 means = yearly_stats['mean'].values
-                if len(years) > 2:
-                    slope, intercept, r_value, p_value, std_err = stats.linregress(years, means)
-                    trend_significance = 'Significant' if p_value < 0.05 else 'Not Significant'
+                
+                # Check for valid data before regression
+                valid_mask = ~(np.isnan(years) | np.isnan(means) | np.isinf(years) | np.isinf(means))
+                years_clean = years[valid_mask]
+                means_clean = means[valid_mask]
+                
+                if len(years_clean) > 2 and len(means_clean) > 2:
+                    try:
+                        slope, intercept, r_value, p_value, std_err = stats.linregress(years_clean, means_clean)
+                        trend_significance = 'Significant' if p_value < 0.05 else 'Not Significant'
+                    except (ValueError, TypeError) as e:
+                        slope, r_value, p_value, trend_significance = 0, 0, 1, 'Error in Calculation'
                 else:
                     slope, r_value, p_value, trend_significance = 0, 0, 1, 'Insufficient Data'
                 
@@ -123,22 +135,22 @@ def calculate_monthly_shifts(df, target_vars):
                 # Recent trend (last 6 months)
                 if len(monthly_stats) >= 6:
                     recent_6m = monthly_stats.tail(6)
-                    months_num = range(len(recent_6m))
+                    months_num = np.arange(len(recent_6m))
                     means = recent_6m['mean'].values
                     
-                    if len(means) > 2:
-                        slope, _, r_value, p_value, _ = stats.linregress(months_num, means)
-                        
-                        results.append({
-                            'Product': product,
-                            'Target_Variable': target,
-                            'Analysis_Type': 'Month_over_Month',
-                            'Recent_6M_Trend_Slope': round(slope, 4),
-                            'Recent_6M_R_Squared': round(r_value**2, 3),
-                            'Recent_6M_Significance': 'Significant' if p_value < 0.05 else 'Not Significant',
-                            'Latest_3M_Avg_Change': round(monthly_stats['Rolling_3M_Change'].tail(1).values[0], 2) if not monthly_stats['Rolling_3M_Change'].tail(1).isna().values[0] else 0,
-                            'Months_Available': len(monthly_stats)
-                        })
+                    # Clean data for regression
+                    valid_mask = ~(np.isnan(means) | np.isinf(means))
+                    months_clean = months_num[valid_mask]
+                    means_clean = means[valid_mask]
+                    
+                    if len(means_clean) > 2:
+                        try:
+                            slope, _, r_value, p_value, _ = stats.linregress(months_clean, means_clean)
+                            trend_significance = 'Significant' if p_value < 0.05 else 'Not Significant'
+                        except (ValueError, TypeError):
+                            slope, r_value, p_value, trend_significance = 0, 0, 1, 'Error in Calculation'
+                    else:
+                        slope, r_value, p_value, trend_significance = 0, 0, 1, 'Insufficient Data'
     
     return pd.DataFrame(results)
 
