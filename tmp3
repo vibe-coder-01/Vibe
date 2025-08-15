@@ -1,0 +1,312 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+def load_and_prepare_data(df):
+    """
+    Prepare the dataset for analysis
+    """
+    # Convert date column to datetime
+    df['GMT Prod Yield Date'] = pd.to_datetime(df['GMT Prod Yield Date'])
+    
+    # Extract year and month for temporal analysis
+    df['Year'] = df['GMT Prod Yield Date'].dt.year
+    df['Month'] = df['GMT Prod Yield Date'].dt.month
+    df['Year_Month'] = df['GMT Prod Yield Date'].dt.to_period('M')
+    
+    # Define target variables
+    target_vars = ['Y1', 'Y2', 'Y3', 'Y4', 'Y5']
+    
+    return df, target_vars
+
+def calculate_shift_metrics(df, target_vars):
+    """
+    Calculate comprehensive shift metrics for each product type
+    """
+    results = []
+    
+    for product in df['Merge'].unique():
+        if pd.isna(product):
+            continue
+            
+        product_data = df[df['Merge'] == product].copy()
+        
+        for target in target_vars:
+            if target not in product_data.columns:
+                continue
+                
+            # Remove missing values for calculations
+            clean_data = product_data.dropna(subset=[target])
+            
+            if len(clean_data) < 10:  # Skip if insufficient data
+                continue
+            
+            # Year-over-year analysis
+            yearly_stats = clean_data.groupby('Year')[target].agg([
+                'mean', 'median', 'std', 'count'
+            ]).reset_index()
+            
+            # Calculate year-over-year changes
+            if len(yearly_stats) > 1:
+                yearly_stats['YoY_Mean_Change'] = yearly_stats['mean'].pct_change() * 100
+                yearly_stats['YoY_Median_Change'] = yearly_stats['median'].pct_change() * 100
+                
+                # Recent vs baseline comparison (last year vs first year)
+                recent_mean = yearly_stats['mean'].iloc[-1]
+                baseline_mean = yearly_stats['mean'].iloc[0]
+                total_change = ((recent_mean - baseline_mean) / baseline_mean) * 100 if baseline_mean != 0 else 0
+                
+                # Trend analysis using linear regression
+                years = yearly_stats['Year'].values
+                means = yearly_stats['mean'].values
+                if len(years) > 2:
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(years, means)
+                    trend_significance = 'Significant' if p_value < 0.05 else 'Not Significant'
+                else:
+                    slope, r_value, p_value, trend_significance = 0, 0, 1, 'Insufficient Data'
+                
+                results.append({
+                    'Product': product,
+                    'Target_Variable': target,
+                    'Analysis_Type': 'Year_over_Year',
+                    'Total_Change_Pct': round(total_change, 2),
+                    'Trend_Slope': round(slope, 4),
+                    'Trend_R_Squared': round(r_value**2, 3),
+                    'Trend_Significance': trend_significance,
+                    'Years_Available': len(yearly_stats),
+                    'Latest_Mean': round(recent_mean, 3),
+                    'Baseline_Mean': round(baseline_mean, 3)
+                })
+    
+    return pd.DataFrame(results)
+
+def calculate_monthly_shifts(df, target_vars):
+    """
+    Calculate month-over-month shifts for recent periods
+    """
+    results = []
+    
+    # Focus on last 24 months for monthly analysis
+    recent_date = df['GMT Prod Yield Date'].max()
+    cutoff_date = recent_date - pd.DateOffset(months=24)
+    recent_df = df[df['GMT Prod Yield Date'] >= cutoff_date].copy()
+    
+    for product in recent_df['Merge'].unique():
+        if pd.isna(product):
+            continue
+            
+        product_data = recent_df[recent_df['Merge'] == product].copy()
+        
+        for target in target_vars:
+            if target not in product_data.columns:
+                continue
+                
+            clean_data = product_data.dropna(subset=[target])
+            
+            if len(clean_data) < 6:  # Need at least 6 months
+                continue
+            
+            # Monthly aggregation
+            monthly_stats = clean_data.groupby('Year_Month')[target].agg([
+                'mean', 'median', 'count'
+            ]).reset_index()
+            
+            if len(monthly_stats) > 3:
+                # Calculate rolling 3-month changes
+                monthly_stats['Rolling_3M_Change'] = monthly_stats['mean'].pct_change(periods=3) * 100
+                
+                # Recent trend (last 6 months)
+                if len(monthly_stats) >= 6:
+                    recent_6m = monthly_stats.tail(6)
+                    months_num = range(len(recent_6m))
+                    means = recent_6m['mean'].values
+                    
+                    if len(means) > 2:
+                        slope, _, r_value, p_value, _ = stats.linregress(months_num, means)
+                        
+                        results.append({
+                            'Product': product,
+                            'Target_Variable': target,
+                            'Analysis_Type': 'Month_over_Month',
+                            'Recent_6M_Trend_Slope': round(slope, 4),
+                            'Recent_6M_R_Squared': round(r_value**2, 3),
+                            'Recent_6M_Significance': 'Significant' if p_value < 0.05 else 'Not Significant',
+                            'Latest_3M_Avg_Change': round(monthly_stats['Rolling_3M_Change'].tail(1).values[0], 2) if not monthly_stats['Rolling_3M_Change'].tail(1).isna().values[0] else 0,
+                            'Months_Available': len(monthly_stats)
+                        })
+    
+    return pd.DataFrame(results)
+
+def create_shift_summary(yearly_df, monthly_df):
+    """
+    Create a comprehensive summary of shifts by product and target
+    """
+    # Merge yearly and monthly results
+    summary = yearly_df.merge(
+        monthly_df, 
+        on=['Product', 'Target_Variable'], 
+        how='outer'
+    )
+    
+    # Create shift severity categories
+    def categorize_shift(row):
+        total_change = abs(row.get('Total_Change_Pct', 0))
+        trend_sig = row.get('Trend_Significance', 'Not Significant')
+        recent_sig = row.get('Recent_6M_Significance', 'Not Significant')
+        
+        if total_change > 20 and trend_sig == 'Significant':
+            return 'High Impact Shift'
+        elif total_change > 10 and (trend_sig == 'Significant' or recent_sig == 'Significant'):
+            return 'Medium Impact Shift'
+        elif total_change > 5:
+            return 'Low Impact Shift'
+        else:
+            return 'Stable'
+    
+    summary['Shift_Category'] = summary.apply(categorize_shift, axis=1)
+    
+    return summary
+
+def visualize_shifts(df, target_vars, summary_df):
+    """
+    Create visualizations for target variable shifts
+    """
+    # Set up the plotting style
+    plt.style.use('default')
+    sns.set_palette("husl")
+    
+    # 1. Heatmap of total changes by product and target
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Target Variable Shift Analysis Dashboard', fontsize=16, fontweight='bold')
+    
+    # Heatmap of total percentage changes
+    pivot_data = summary_df.pivot(index='Product', columns='Target_Variable', values='Total_Change_Pct')
+    sns.heatmap(pivot_data, annot=True, cmap='RdYlBu_r', center=0, 
+                ax=axes[0,0], fmt='.1f', cbar_kws={'label': 'Total Change %'})
+    axes[0,0].set_title('Total Change % by Product and Target (YoY)')
+    axes[0,0].set_xlabel('')
+    
+    # 2. Shift category distribution
+    shift_counts = summary_df['Shift_Category'].value_counts()
+    axes[0,1].pie(shift_counts.values, labels=shift_counts.index, autopct='%1.1f%%', startangle=90)
+    axes[0,1].set_title('Distribution of Shift Categories')
+    
+    # 3. Top products with highest variability
+    product_variability = summary_df.groupby('Product')['Total_Change_Pct'].apply(
+        lambda x: np.sqrt(np.mean(x**2))  # RMS of changes
+    ).sort_values(ascending=False).head(10)
+    
+    product_variability.plot(kind='barh', ax=axes[1,0])
+    axes[1,0].set_title('Top 10 Products by Variability (RMS of Changes)')
+    axes[1,0].set_xlabel('RMS of Total Changes %')
+    
+    # 4. Trend significance by target variable
+    sig_counts = summary_df.groupby(['Target_Variable', 'Trend_Significance']).size().unstack(fill_value=0)
+    sig_counts.plot(kind='bar', ax=axes[1,1], stacked=True)
+    axes[1,1].set_title('Trend Significance by Target Variable')
+    axes[1,1].set_xlabel('Target Variables')
+    axes[1,1].set_ylabel('Count of Products')
+    axes[1,1].legend(title='Significance')
+    axes[1,1].tick_params(axis='x', rotation=0)
+    
+    plt.tight_layout()
+    return fig
+
+def generate_insights_report(summary_df):
+    """
+    Generate key insights from the analysis
+    """
+    insights = []
+    
+    # Overall statistics
+    total_combinations = len(summary_df)
+    high_impact = len(summary_df[summary_df['Shift_Category'] == 'High Impact Shift'])
+    medium_impact = len(summary_df[summary_df['Shift_Category'] == 'Medium Impact Shift'])
+    
+    insights.append(f"EXECUTIVE SUMMARY:")
+    insights.append(f"- Analyzed {total_combinations} product-target combinations")
+    insights.append(f"- {high_impact} combinations show HIGH IMPACT shifts (>20% change)")
+    insights.append(f"- {medium_impact} combinations show MEDIUM IMPACT shifts (10-20% change)")
+    
+    # Most problematic products
+    if high_impact > 0:
+        high_impact_products = summary_df[summary_df['Shift_Category'] == 'High Impact Shift']['Product'].value_counts()
+        insights.append(f"\nMOST PROBLEMATIC PRODUCTS:")
+        for product, count in high_impact_products.head(3).items():
+            insights.append(f"- {product}: {count} high-impact target variables")
+    
+    # Most affected target variables
+    target_impact = summary_df[summary_df['Shift_Category'].isin(['High Impact Shift', 'Medium Impact Shift'])]['Target_Variable'].value_counts()
+    if len(target_impact) > 0:
+        insights.append(f"\nMOST AFFECTED TARGET VARIABLES:")
+        for target, count in target_impact.head(3).items():
+            insights.append(f"- {target}: {count} products showing significant shifts")
+    
+    # Recent trend concerns
+    recent_concerns = summary_df[summary_df['Recent_6M_Significance'] == 'Significant']
+    if len(recent_concerns) > 0:
+        insights.append(f"\nRECENT TREND CONCERNS (Last 6 months):")
+        insights.append(f"- {len(recent_concerns)} combinations showing significant recent deterioration")
+        
+        # Top recent concerns
+        recent_top = recent_concerns.nlargest(3, 'Latest_3M_Avg_Change')[['Product', 'Target_Variable', 'Latest_3M_Avg_Change']]
+        for _, row in recent_top.iterrows():
+            insights.append(f"  • {row['Product']} - {row['Target_Variable']}: {row['Latest_3M_Avg_Change']:.1f}% change")
+    
+    return "\n".join(insights)
+
+def main_analysis(df):
+    """
+    Main analysis function
+    """
+    print("🔍 MACHINE UTILIZATION & OEE TARGET VARIABLE SHIFT ANALYSIS")
+    print("="*70)
+    
+    # Prepare data
+    df_prep, target_vars = load_and_prepare_data(df)
+    
+    print(f"📊 Dataset Overview:")
+    print(f"- Date range: {df_prep['GMT Prod Yield Date'].min()} to {df_prep['GMT Prod Yield Date'].max()}")
+    print(f"- Total records: {len(df_prep):,}")
+    print(f"- Unique products: {df_prep['Merge'].nunique()}")
+    print(f"- Target variables: {target_vars}")
+    
+    # Calculate shifts
+    print("\n⚙️  Calculating year-over-year shifts...")
+    yearly_shifts = calculate_shift_metrics(df_prep, target_vars)
+    
+    print("⚙️  Calculating month-over-month shifts...")
+    monthly_shifts = calculate_monthly_shifts(df_prep, target_vars)
+    
+    # Create comprehensive summary
+    summary = create_shift_summary(yearly_shifts, monthly_shifts)
+    
+    # Generate insights
+    insights = generate_insights_report(summary)
+    
+    # Create visualizations
+    fig = visualize_shifts(df_prep, target_vars, summary)
+    
+    print("\n📈 KEY INSIGHTS:")
+    print(insights)
+    
+    print("\n📋 DETAILED RESULTS:")
+    print("\nTop 10 Combinations by Impact:")
+    top_impacts = summary.nlargest(10, 'Total_Change_Pct')[
+        ['Product', 'Target_Variable', 'Total_Change_Pct', 'Shift_Category', 'Trend_Significance']
+    ]
+    print(top_impacts.to_string(index=False))
+    
+    return summary, fig, insights
+
+# Usage example:
+# summary_results, visualization, key_insights = main_analysis(your_dataframe)
+
+print("✅ Target Variable Shift Analysis Module Ready!")
+print("📝 Usage: summary, plot, insights = main_analysis(your_dataframe)")
+print("🎯 Focus: Identifies shifts by product type affecting machine utilization")
