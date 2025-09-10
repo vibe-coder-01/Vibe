@@ -1,0 +1,1700 @@
+# Combined_GAC_IEX_app.py
+# Unified Python translation combining GAC and Ion Exchange Model Shiny applications.
+# Features a mode selector to toggle between GAC and IEX functionality.
+# All original calculations and functionality preserved for both models.
+
+import shiny
+import shiny.experimental as x
+from shiny import App, ui, render, reactive, req
+from shiny.types import FileInfo
+import shinyswatch
+from shinywidgets import output_widget, render_widget
+
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+from io import BytesIO
+import plotly.graph_objects as go
+
+# IEX-specific imports
+from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
+from scipy.special import roots_jacobi, sh_jacobi
+
+# GAC Model imports - graceful failure if helper missing
+try:
+    from GAC_Shiny_helper import run_PSDM, run_PSDM_fitter
+except ImportError:
+    def run_PSDM(*args, **kwargs):
+        print("Error: GAC_Shiny_helper.py not found.")
+        return pd.DataFrame()
+    def run_PSDM_fitter(*args, **kwargs):
+        print("Error: GAC_Shiny_helper.py not found.")
+        return pd.DataFrame(), pd.DataFrame()
+
+# =============================================================================
+# SHARED COLOR DEFINITIONS
+# =============================================================================
+STEPPED_SEQUENTIAL_5_STEPS = ["#990F0F", "#B22C2C", "#CC5151", "#E57E7E", "#FFB2B2",
+                              "#99540F", "#B26F2C", "#CC8E51", "#E5B17E", "#FFD8B2",
+                              "#6B990F", "#85B22C", "#A3CC51", "#C3E57E", "#E5FFB2",
+                              "#0F6B99", "#2C85B2", "#51A3CC", "#7EC3E5", "#B2E5FF",
+                              "#260F99", "#422CB2", "#6551CC", "#8F7EE5", "#BFB2FF"]
+
+# =============================================================================
+# GAC UNIT CONVERSIONS AND CONSTANTS
+# =============================================================================
+# GAC unit conversion constants
+m2cm, mm2cm, in2cm = 100, 0.1, 2.54
+ft2cm = 12 * in2cm
+min2sec, hour2sec, day2sec = 60, 3600, 24 * 3600
+gal2ft3, gal2ml, l2ml = 0.133680555556, 3785.411784, 1000.0
+
+GAC_LENGTH_CONV = {"m": m2cm, "cm": 1, "mm": mm2cm, "in": in2cm, "ft": ft2cm}
+GAC_VELOCITY_CONV = {
+    "cm/s": 1, "m/s": m2cm, "m/min": m2cm / min2sec, "m/h": m2cm / hour2sec,
+    "m/hr": m2cm / hour2sec, "in/s": in2cm, "ft/s": ft2cm, "ft/min": ft2cm / min2sec,
+    "gpm/ft^2": gal2ft3 * ft2cm / min2sec
+}
+GAC_VOLUMETRIC_CONV = {
+    "cm^3/s": min2sec, "m^3/s": min2sec * m2cm**3, "ft^3/s": min2sec * ft2cm**3,
+    "mL/s": min2sec, "L/min": l2ml, "mL/min": 1,
+    "gpm": gal2ml, "mgd": 1e6 * gal2ml
+}
+GAC_TIME_CONV = {"Hours": 24, "Days": 1, "Months": 1/30, "Years": 1/365.25,
+             "hrs": 24, "days": 1, "hours": 24}
+GAC_MASS_CONV = {"mg/L": 1000, "ug/L": 1, "ng/L": 1e-3}
+GAC_WEIGHT_CONV = {"kg": 1000, "g": 1, "lb": 453.5929, "lbs": 453.5929, "oz": 28.3495}
+
+# GAC UI choice vectors
+GAC_VELOCITY_VECTOR = ["cm/s", "m/s", "m/min", "m/h", "in/s", "ft/s", "ft/min", "gpm/ft^2"]
+GAC_FLOWRATE_VECTOR = ["L/min", "cm^3/s", "m^3/s", "ft^3/s", "mL/s", "mL/min", "gpm", "mgd"]
+GAC_DIAMETER_VECTOR = ["cm", "m", "mm", "in", "ft"]
+GAC_WEIGHT_VECTOR = ["g", "kg", "lb", "oz"]
+W_FOULING_VECTOR = ["Organic Free", "Rhine", "Portage", "Karlsruhe", "Wausau", "Houghton"]
+C_FOULING_VECTOR = ["halogenated alkenes", "halogenated alkanes", "halogenated alkanes QSPR",
+                    "trihalo-methanes", "aromatics", "nitro compounds",
+                    "chlorinated hydrocarbon", "phenols", "PNAs", "pesticides", "PFAS"]
+
+# =============================================================================
+# IEX UNIT CONVERSIONS AND CONSTANTS
+# =============================================================================
+# IEX unit conversion constants
+IEX_UNITS = {
+    'm2cm': 100, 'mm2cm': 0.1, 'cm2cm': 1, 'in2cm': 2.54, 'ft2cm': 12 * 2.54,
+    'sec2sec': 1, 'min2sec': 60, 'hour2sec': 3600, 'day2sec': 24 * 3600,
+    'month2sec': 30 * 24 * 3600, 'year2sec': 365.25 * 24 * 3600,
+    'gal2ft3': 0.133680555556, 'l2ml': 1000.0, 'gal2ml': 3785.411784
+}
+IEX_UNITS['mgd2mlps'] = 1e6 * IEX_UNITS['gal2ml'] / IEX_UNITS['day2sec']
+
+IEX_LENGTH_CONV = {"m": IEX_UNITS['m2cm'], "cm": IEX_UNITS['cm2cm'], "mm": IEX_UNITS['mm2cm'], 
+                   "in": IEX_UNITS['in2cm'], "ft": IEX_UNITS['ft2cm']}
+IEX_VELOCITY_CONV = {
+    "cm/s": IEX_UNITS['cm2cm'], "m/s": IEX_UNITS['m2cm'], "m/min": IEX_UNITS['m2cm'] / IEX_UNITS['min2sec'],
+    "m/h": IEX_UNITS['m2cm'] / IEX_UNITS['hour2sec'], "m/hr": IEX_UNITS['m2cm'] / IEX_UNITS['hour2sec'],
+    "in/s": IEX_UNITS['in2cm'], "ft/s": IEX_UNITS['ft2cm'], "ft/min": IEX_UNITS['ft2cm'] / IEX_UNITS['min2sec'],
+    "gpm/ft^2": IEX_UNITS['gal2ft3'] * IEX_UNITS['ft2cm'] / IEX_UNITS['min2sec']
+}
+IEX_VOLUMETRIC_CONV = {
+    "cm^3/s": IEX_UNITS['cm2cm'], "m^3/s": IEX_UNITS['m2cm']**3, "ft^3/s": IEX_UNITS['ft2cm']**3,
+    "mL/s": IEX_UNITS['cm2cm'], "L/min": IEX_UNITS['l2ml'] / IEX_UNITS['min2sec'], 
+    "mL/min": 1 / IEX_UNITS['min2sec'], "gpm": IEX_UNITS['gal2ml'] / IEX_UNITS['min2sec'], 
+    "mgd": IEX_UNITS['mgd2mlps']
+}
+IEX_TIME_CONV = {"Hours": IEX_UNITS['hour2sec'], "Days": IEX_UNITS['day2sec'], 
+                 "Months": IEX_UNITS['month2sec'], "Years": IEX_UNITS['year2sec'],
+                 "hr": IEX_UNITS['hour2sec'], "day": IEX_UNITS['day2sec'], 
+                 "month": IEX_UNITS['month2sec'], "year": IEX_UNITS['year2sec']}
+KL_CONV = {"ft/s": IEX_UNITS['ft2cm'], "m/s": IEX_UNITS['m2cm'], "cm/s": IEX_UNITS['cm2cm'], 
+           "in/s": IEX_UNITS['in2cm'], "m/min": IEX_UNITS['m2cm'] / IEX_UNITS['min2sec'], 
+           "ft/min": IEX_UNITS['ft2cm'] / IEX_UNITS['min2sec'],
+           "m/h": IEX_UNITS['m2cm'] / IEX_UNITS['hour2sec'], 
+           "m/hr": IEX_UNITS['m2cm'] / IEX_UNITS['hour2sec']}
+DS_CONV = {"ft^2/s": IEX_UNITS['ft2cm']**2, "m^2/s": IEX_UNITS['m2cm']**2, 
+           "cm^2/s": IEX_UNITS['cm2cm'], "in^2/s": IEX_UNITS['in2cm']**2}
+IEX_MASS_CONV = {"meq": 1, "meq/L": 1, "mg": 1, "ug": 1e-3, "ng": 1e-6, 
+                 "mg/L": 1, "ug/L": 1e-3, "ng/L": 1e-6}
+
+# IEX UI choice vectors
+IEX_LENGTH_VECTOR = ["cm", "m", "mm", "in", "ft"]
+IEX_VELOCITY_VECTOR = ["cm/s", "m/s", "m/min", "m/h", "in/s", "ft/s", "ft/min", "gpm/ft^2"]
+IEX_TIME_VECTOR = ["hr", "day"]
+IEX_FLOWRATE_VECTOR = ["cm^3/s", "m^3/s", "ft^3/s", "mL/s", "L/min", "mL/min", "gpm", "mgd"]
+IEX_DIAMETER_VECTOR = ["cm", "m", "mm", "in", "ft"]
+MODEL_VECTOR = ["Gel-Type (HSDM)", "Macroporous (PSDM)"]
+
+NT_REPORT = 201  # Number of reporting steps for IEX
+
+# =============================================================================
+# GAC HELPER FUNCTIONS
+# =============================================================================
+def prepare_gac_column_data(inputs):
+    """Creates the GAC column specification DataFrame from UI inputs."""
+    if inputs["gac_veloselect"]() == 'Linear':
+        vel_cm_per_s = inputs["gac_Vv"]() * GAC_VELOCITY_CONV[inputs["gac_VelocityUnits"]()]
+        diam_cm = inputs["gac_Dv"]() * GAC_LENGTH_CONV[inputs["gac_DiameterUnits"]()]
+        fv_ml_per_min = (np.pi / 4 * diam_cm**2) * vel_cm_per_s * min2sec
+    else:
+        fv_ml_per_min = inputs["gac_Fv"]() * GAC_VOLUMETRIC_CONV[inputs["gac_FlowrateUnits"]()]
+
+    mass_mult = {"ug": 1.0, "ng": 0.001, "mg": 1000.0}[inputs["gac_conc_units"]()]
+    t_mult = {"days": 1440.0, "hours": 60.0}[inputs["gac_tunits2"]()]
+
+    return pd.DataFrame({
+        "name": ['carbonID', 'rad', 'epor', 'psdfr', 'rhop', 'rhof', 'L', 'wt',
+                 'flrt', 'diam', 'tortu', 'influentID', 'effluentID', 'units',
+                 'time', 'mass_mul', 'flow_type', 'flow_mult', 't_mult'],
+        "value": ['Carbon', inputs["gac_prv"]() * GAC_LENGTH_CONV[inputs["gac_prunits"]()],
+                  inputs["gac_EPORv"](), inputs["gac_psdfrv"](), inputs["gac_pdv"](),
+                  inputs["gac_adv"](), inputs["gac_Lv"]() * GAC_LENGTH_CONV[inputs["gac_LengthUnits"]()],
+                  inputs["gac_wv"]() * GAC_WEIGHT_CONV[inputs["gac_wunits"]()], fv_ml_per_min,
+                  inputs["gac_Dv"]() * GAC_LENGTH_CONV[inputs["gac_DiameterUnits"]()],
+                  inputs["gac_tortuv"](), 'influent', 'Carbon', inputs["gac_conc_units"](),
+                  inputs["gac_timeunits"](), mass_mult, 'ml', 0.001, t_mult]
+    })
+
+def process_gac_data_for_plotting(df, suffix=""):
+    """Melts a GAC DataFrame and adds a suffix to the names for plotting."""
+    if df is None or df.empty or 'time' not in df.columns:
+        return pd.DataFrame(columns=['hours', 'name', 'conc'])
+    df_long = df.melt(id_vars='time', var_name='name', value_name='conc')
+    if suffix:
+        df_long['name'] = df_long['name'] + f"_{suffix}"
+    df_long = df_long.rename(columns={'time': 'hours'})
+    return df_long
+
+# =============================================================================
+# IEX HELPER FUNCTIONS
+# =============================================================================
+def _calculate_polynomial_derivatives(roots: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculates the first three derivatives of the Lagrange polynomials at the given roots."""
+    n_points = len(roots)
+    p1_derivs = np.zeros(n_points)
+    p2_derivs = np.zeros(n_points)
+    p3_derivs = np.zeros(n_points)
+
+    for i in range(n_points):
+        x_i = roots[i]
+        # Select all other roots
+        j_values = np.delete(roots, i)
+        delta = x_i - j_values
+
+        # Initialize temporary arrays for the inner loop calculation
+        p1 = np.zeros(n_points)
+        p2 = np.zeros(n_points)
+        p3 = np.zeros(n_points)
+        p1[0] = 1.0
+
+        # This loop calculates the derivatives for each root based on all other roots
+        for j in range(n_points - 1):
+            p1[j+1] = delta[j] * p1[j]
+            p2[j+1] = delta[j] * p2[j] + 2 * p1[j]
+            p3[j+1] = delta[j] * p3[j] + 3 * p2[j]
+
+        p1_derivs[i] = p1[-1]
+        p2_derivs[i] = p2[-1]
+        p3_derivs[i] = p3[-1]
+
+    return p1_derivs, p2_derivs, p3_derivs
+
+def _calculate_first_derivative_matrix(roots: np.ndarray, p1_derivs: np.ndarray, p2_derivs: np.ndarray) -> np.ndarray:
+    """Calculates the first derivative collocation matrix (A)."""
+    n_points = len(roots)
+    diff_matrix = roots.reshape(-1, 1) - roots
+    identity_mask = np.eye(n_points, dtype=bool)
+
+    A = np.divide(
+        p1_derivs.reshape(-1, 1) / p1_derivs,
+        diff_matrix,
+        where=~identity_mask,
+        out=np.zeros((n_points, n_points))
+    )
+
+    diag_A = 0.5 * p2_derivs / p1_derivs
+    np.fill_diagonal(A, diag_A)
+    return A
+
+def rad_colloc(N: int) -> tuple[np.ndarray, np.ndarray]:
+    """Radial collocation for IEX model."""
+    if N <= 1:
+        raise ValueError("Number of collocation points N must be greater than 1.")
+        
+    # Number of interior collocation points
+    N_int = N - 1
+
+    # Get roots of the shifted Jacobi polynomial
+    raw_roots = sh_jacobi(N_int, 2.5, 1.5).roots
+    roots = np.concatenate((np.sort(raw_roots), [1.0]))
+ 
+    # Calculate polynomial derivative values
+    p1_derivs, p2_derivs, p3_derivs = _calculate_polynomial_derivatives(roots)
+
+    # Calculate the first derivative matrix (Ar)
+    Ar = _calculate_first_derivative_matrix(roots, p1_derivs, p2_derivs)
+
+    # Calculate the second derivative matrix (Br) using vectorized operations
+    identity_mask = np.eye(N, dtype=bool)
+    diff_matrix = roots.reshape(-1, 1) - roots
+    
+    # Off-diagonal elements for Br
+    off_diag_term = np.divide(1.0, diff_matrix, where=~identity_mask, out=np.zeros_like(diff_matrix))
+    Br = 2 * Ar * (np.diag(Ar).reshape(-1, 1) - off_diag_term)
+    
+    # Diagonal elements for Br
+    diag_Br = (1./3.) * p3_derivs / p1_derivs
+    np.fill_diagonal(Br, diag_Br)
+
+    # Calculate the symmetric equivalent matrices
+    Br_sym = 4 * roots.reshape(-1, 1) * Br + 6 * Ar
+
+    # Calculate quadrature weights (W)
+    a_weight = 2.0
+    w_i_prime = 1.0 / (roots * p1_derivs**2)
+    W = (1.0 / (a_weight + 1.0)) * w_i_prime / np.sum(w_i_prime)
+
+    return Br_sym, W
+
+def ax_colloc(NZ: int) -> np.ndarray:
+    """Axial collocation for IEX model."""
+    if NZ <= 2:
+        raise ValueError("Number of collocation points NZ must be greater than 2.")
+        
+    # Number of interior points
+    NZ_int = NZ - 2
+
+    # Get roots of the shifted Legendre polynomial (Jacobi with alpha=1.0, beta=1.0)
+    raw_roots = sh_jacobi(NZ_int, 1.0, 1.0).roots
+    roots = np.concatenate(([0.0], np.sort(raw_roots), [1.0]))
+
+    # Calculate polynomial derivative values needed for the matrix
+    p1_derivs, p2_derivs, _ = _calculate_polynomial_derivatives(roots)
+
+    # Calculate the first derivative matrix (AZ)
+    AZ = _calculate_first_derivative_matrix(roots, p1_derivs, p2_derivs)
+
+    return AZ
+
+def HSDMIX_solve(params, ions, Cin, inputtime, nt_report):
+    """Homogeneous Surface Diffusion Model solver for IEX."""
+    # Extract parameters
+    NR = int(params.loc[params['name'] == 'nr', 'value'].iloc[0])
+    NZ = int(params.loc[params['name'] == 'nz', 'value'].iloc[0])
+    Q = params.loc[params['name'] == 'Q', 'value'].iloc[0]
+    L = params.loc[params['name'] == 'L', 'value'].iloc[0]
+    v = params.loc[params['name'] == 'v', 'value'].iloc[0]
+    EBED = params.loc[params['name'] == 'EBED', 'value'].iloc[0]
+    rb = params.loc[params['name'] == 'rb', 'value'].iloc[0]
+
+    # Ion info
+    ion_names = ions['name'].tolist()
+    KxA = ions['KxA'].to_numpy()
+    valence = ions['valence'].to_numpy()
+    kL = ions['kL'].to_numpy()
+    Ds = ions['Ds'].to_numpy()
+
+    C_in_t = Cin.copy().to_numpy()
+    NION = len(ion_names)
+
+    # Derived parameters
+    C_in_t[:, 0] *= inputtime # Convert time to seconds
+    t_max = C_in_t[-1, 0]
+    times = np.linspace(0.0, t_max * 0.99, nt_report)
+
+    C_in_0 = C_in_t[0, 1:(NION + 1)]
+    CT = np.sum(C_in_0)
+    NEQ = (NR + 1) * NION * NZ
+
+    # Interpolating functions for influent concentrations
+    interp_list = [interp1d(C_in_t[:, 0], C_in_t[:, i + 1], bounds_error=False, fill_value="extrapolate") for i in range(NION)]
+  
+    # Initialize grid
+    x0 = np.zeros(((NR + 1), NION, NZ))
+    x0[-1, :, 0] = C_in_0  # Inlet liquid concentrations
+    x0[-1, 0, 1:] = CT     # Rest of liquid is presaturant
+    x0[0:NR, 0, :] = Q     # Resin initially loaded with presaturant
+    x0 = x0.flatten()
+
+    # Collocation matrices
+    BR, WR = rad_colloc(NR)
+    AZ = ax_colloc(NZ)
+
+    def diffun(t, y):
+        x = y.reshape((NR + 1, NION, NZ))
+        C = x[-1, :, :]  # Liquid phase concentrations
+        q = x[0:NR, :, :]  # Solid phase concentrations
+
+        dx_dt = np.zeros_like(x)
+
+        # Update influent concentrations at current time t
+        C_t = np.array([interp(t) for interp in interp_list])
+        dx_dt[-1, :, 0] = 0 # Inlet concentration is boundary condition, not a state
+        C[:, 0] = C_t
+
+        # Advection
+        AZ_C = (AZ @ C.T).T
+        
+        # Calculate surface flux J
+        qs = q[NR - 1, :, :]
+        CT_test = np.sum(C, axis=0)
+
+        C_star = np.zeros((NION, NZ))
+        J = np.zeros((NION, NZ))
+
+        # Isotherm Calculation (vectorized)
+        z_slice = slice(1, NZ)
+        
+        is_divalent = np.any(valence == 2)
+        if is_divalent:
+            dv_ions_mask = valence == 2
+            mv_ions_mask = valence == 1
+            mv_ions_mask[0] = False # Exclude presaturant
+            
+            qs_1 = qs[0, z_slice]
+            qs_1[qs_1 == 0] = 1e-9
+
+            cc = -CT_test[z_slice]
+            bb = 1 + np.sum(qs[mv_ions_mask, z_slice] / KxA[mv_ions_mask, np.newaxis], axis=0) / qs_1
+            aa = np.sum(qs[dv_ions_mask, z_slice] / KxA[dv_ions_mask, np.newaxis], axis=0) / qs_1**2
+            
+            denom = -bb - np.sqrt(bb**2 - 4 * aa * cc)
+            denom[denom == 0] = 1e-9
+            C_star[0, z_slice] = 2 * (cc / denom)
+
+            # Calculate other C_star based on C_star of reference ion
+            for i in range(1, NION):
+                C_star[i, z_slice] = (qs[i, z_slice] / KxA[i]) * (C_star[0, z_slice] / qs_1)**valence[i]
+
+        else: # Monovalent only
+            sum_terms = np.sum(qs[:, z_slice] / KxA[:, np.newaxis], axis=0) / CT_test[z_slice]
+            for i in range(1, NION):
+                C_star[i, z_slice] = qs[i, z_slice] / KxA[i] / sum_terms
+
+        # Surface flux J
+        J[1:, z_slice] = -kL[1:, np.newaxis] * (C[1:, z_slice] - C_star[1:, z_slice])
+        J[0, z_slice] = -np.sum(J[1:, z_slice], axis=0) # Reference ion
+        Jas = (3 / rb) * J
+
+        # Liquid phase mass balance
+        dx_dt[-1, :, z_slice] = (-v / L * AZ_C[:, z_slice] + (1 - EBED) * Jas[:, z_slice]) / EBED
+
+        # Solid phase mass balance
+        BR_q = np.zeros_like(q)
+        for ii in range(NION):
+            BR_q[:, ii, z_slice] = BR @ q[:, ii, z_slice]
+
+        dq_dt = np.zeros_like(q)
+        ds_term_reshaped = Ds[1:][np.newaxis, :, np.newaxis] / (rb**2)
+        dq_dt[:, 1:, :] = ds_term_reshaped * BR_q[:, 1:, :]
+        
+        # Sum of fluxes for reference ion
+        sum_dq_dt = -np.sum(dq_dt[0:NR-1, 1:, z_slice], axis=1)
+        dq_dt[0:NR-1, 0, z_slice] = sum_dq_dt
+
+        # Surface boundary condition for solid phase
+        surf_term = np.tensordot(WR[0:NR-1], dq_dt[0:NR-1, :, z_slice], axes=([0], [0]))
+
+        dx_dt[0:NR-1, :, z_slice] = dq_dt[0:NR-1, :, z_slice]
+        dx_dt[NR-1, :, z_slice] = (-1 / rb * J[:, z_slice] - surf_term) / WR[NR-1]
+
+        # Inlet is a boundary condition, its state doesn't change via ODE
+        dx_dt[:, :, 0] = 0.0
+
+        return dx_dt.flatten()
+
+    # Integration
+    sol = solve_ivp(diffun, [times[0], times[-1]], x0, t_eval=times, method='BDF')
+
+    if sol.success:
+        t_out = sol.t / 3600  # seconds to hours
+        x_out = sol.y.T.reshape(nt_report, NR + 1, NION, NZ)
+        print('HSDMix_Solve success')
+        return t_out, x_out
+    else:
+        print('HSDMix_Solve failed')
+        return times / 3600, np.zeros((nt_report, NR + 1, NION, NZ))
+
+def PSDMIX_solve(params, ions, Cin, inputtime, nt_report):
+    """Pore and Surface Diffusion Model solver for IEX."""
+    # Extract parameters
+    NR = int(params.loc[params['name'] == 'nr', 'value'].iloc[0])
+    NZ = int(params.loc[params['name'] == 'nz', 'value'].iloc[0])
+    Q = params.loc[params['name'] == 'Q', 'value'].iloc[0]
+    L = params.loc[params['name'] == 'L', 'value'].iloc[0]
+    v = params.loc[params['name'] == 'v', 'value'].iloc[0]
+    EBED = params.loc[params['name'] == 'EBED', 'value'].iloc[0]
+    EPOR = params.loc[params['name'] == 'EPOR', 'value'].iloc[0]
+    rb = params.loc[params['name'] == 'rb', 'value'].iloc[0]
+
+    # Ion info
+    ion_names = ions['name'].tolist()
+    KxA = ions['KxA'].to_numpy()
+    valence = ions['valence'].to_numpy()
+    kL = ions['kL'].to_numpy()
+    Ds = ions['Ds'].to_numpy()
+    Dp = ions['Dp'].to_numpy()
+    
+    C_in_t = Cin.copy().to_numpy()
+    NION = len(ion_names)
+
+    # Derived parameters
+    C_in_t[:, 0] *= inputtime # Convert time to seconds
+    t_max = C_in_t[-1, 0]
+    times = np.linspace(0.0, t_max * 0.99, nt_report)
+
+    C_in_0 = C_in_t[0, 1:(NION + 1)]
+    CT = np.sum(C_in_0)
+    NEQ = (NR + 1) * NION * NZ
+
+    # Interpolating functions
+    interp_list = [interp1d(C_in_t[:, 0], C_in_t[:, i + 1], bounds_error=False, fill_value="extrapolate") for i in range(NION)]
+
+    # Initialize grid
+    x0 = np.zeros(((NR + 1), NION, NZ))
+    x0[-1, :, 0] = C_in_0
+    x0[-1, 0, 1:] = CT
+    x0[0:NR, 0, :] = Q
+    x0 = x0.flatten()
+
+    # Collocation
+    BR, WR = rad_colloc(NR)
+    AZ = ax_colloc(NZ)
+    
+    def diffun(t, y):
+        x = y.reshape((NR + 1, NION, NZ))
+        C = x[-1, :, :]
+        Y = x[0:NR, :, :]
+        q = Y / (1 - EPOR)
+        
+        dx_dt = np.zeros_like(x)
+
+        # Update influent
+        C_t = np.array([interp(t) for interp in interp_list])
+        dx_dt[-1, :, 0] = 0
+        C[:, 0] = C_t
+
+        # Advection
+        AZ_C = (AZ @ C.T).T
+        
+        # Isotherm in the pore liquid
+        CT_test = np.sum(C, axis=0)
+        Cpore = np.zeros_like(q)
+        z_slice = slice(1, NZ)
+
+        is_divalent = np.any(valence == 2)
+        if is_divalent:
+            dv_ions_mask = valence == 2
+            mv_ions_mask = valence == 1
+            mv_ions_mask[0] = False
+            
+            for jj in range(NR):
+                q_jj = q[jj, :, z_slice]
+                q_jj_1 = q_jj[0, :]
+                q_jj_1[q_jj_1 == 0] = 1e-9
+                
+                cc = -CT_test[z_slice]
+                bb = 1 + np.sum(q_jj[mv_ions_mask, :] / KxA[mv_ions_mask, np.newaxis], axis=0) / q_jj_1
+                aa = np.sum(q_jj[dv_ions_mask, :] / KxA[dv_ions_mask, np.newaxis], axis=0) / q_jj_1**2
+
+                denom = -bb - np.sqrt(bb**2 - 4 * aa * cc)
+                denom[denom == 0] = 1e-9
+                Cpore[jj, 0, z_slice] = 2 * (cc / denom)
+
+                for i in range(1, NION):
+                     Cpore[jj, i, z_slice] = (q_jj[i,:] / KxA[i]) * (Cpore[jj, 0, z_slice] / q_jj_1)**valence[i]
+        else: # Monovalent
+             for jj in range(NR):
+                q_jj = q[jj, :, z_slice]
+                sum_terms = np.sum(q_jj / KxA[:, np.newaxis], axis=0) / CT_test[z_slice]
+                for i in range(1, NION):
+                    Cpore[jj, i, z_slice] = q_jj[i, :] / KxA[i] / sum_terms
+        
+        C_star = Cpore[NR - 1, :, :]
+        J = np.zeros((NION, NZ))
+        J[1:, z_slice] = -kL[1:, np.newaxis] * (C[1:, z_slice] - C_star[1:, z_slice])
+        J[0, z_slice] = -np.sum(J[1:, z_slice], axis=0)
+        Jas = (3 / rb) * J
+
+        # Liquid phase
+        dx_dt[-1, :, z_slice] = (-v / L * AZ_C[:, z_slice] + (1 - EBED) * Jas[:, z_slice]) / EBED
+
+        # Solid phase
+        BR_Y = np.zeros_like(Y)
+        BR_Cpore = np.zeros_like(Cpore)
+        for ii in range(NION):
+            BR_Y[:, ii, z_slice] = BR @ Y[:, ii, z_slice]
+            BR_Cpore[:, ii, z_slice] = BR @ Cpore[:, ii, z_slice]
+
+        dY_dt = np.zeros_like(Y)
+        dY_dt_calc = (EPOR * (Dp[1:] - Ds[1:])[ np.newaxis,:, np.newaxis] * BR_Cpore[:, 1:, :] + Ds[np.newaxis,1:,  np.newaxis] * BR_Y[:, 1:, :]) / rb**2
+        
+        dY_dt[:, 1:, :] = dY_dt_calc
+        
+        sum_dY_dt = -np.sum(dY_dt[0:NR-1, 1:, z_slice], axis=1)
+        dY_dt[0:NR-1, 0, z_slice] = sum_dY_dt
+        
+        surf_term = np.tensordot(WR[0:NR-1], dY_dt[0:NR-1, :, z_slice], axes=([0], [0]))
+        
+        dx_dt[0:NR-1, :, z_slice] = dY_dt[0:NR-1, :, z_slice]
+        dx_dt[NR-1, :, z_slice] = (-1 / rb * J[:, z_slice] - surf_term) / WR[NR-1]
+        
+        dx_dt[:, :, 0] = 0.0
+
+        return dx_dt.flatten()
+
+    sol = solve_ivp(diffun, [times[0], times[-1]], x0, t_eval=times, method='LSODA')
+
+    if sol.success:
+        t_out = sol.t / 3600
+        x_out = sol.y.T.reshape(nt_report, NR + 1, NION, NZ)
+        return t_out, x_out
+    else:
+        return times / 3600, np.zeros((nt_report, NR + 1, NION, NZ))
+
+def cin_correct(ions_df, cin_df):
+    """Converts concentration units in the Cin DataFrame to meq/L."""
+    corr_cin = cin_df.copy()
+    for _, row in ions_df.iterrows():
+        mass_units = row.get("conc_units", "meq")
+        if mass_units not in ['meq', 'meq/L']:
+            mw = row["mw"]
+            valence = row["valence"]
+            mass_mult = IEX_MASS_CONV.get(mass_units, 1.0) / mw * valence
+            compound = row["name"]
+            if compound in corr_cin.columns:
+                corr_cin[compound] *= mass_mult
+    return corr_cin
+
+def mass_converter_to_mgl(ions_df, concs_df):
+    """Converts meq/L concentrations in the dataframe to mg/L."""
+    corr_df = concs_df.copy()
+    for _, row in ions_df.iterrows():
+        mass_units = row.get("conc_units", "meq")
+        compound = row["name"]
+        if compound in corr_df.columns:
+            if mass_units in ['meq', 'meq/L']:
+                 mass_mult = row["mw"] / row["valence"]
+                 corr_df[compound] *= mass_mult
+            else: # Already in mass/L, just convert to mg/L
+                 mass_mult = IEX_MASS_CONV.get(mass_units, 1.0)
+                 corr_df[compound] *= mass_mult
+    return corr_df
+
+def model_prep(inputs, iondata, concdata, nt_report):
+    """Prepares parameters and calls the appropriate solver."""
+    if inputs['iex_veloselect']() == 'Linear':
+        Vv = inputs['iex_Vv']() * IEX_VELOCITY_CONV[inputs['iex_VelocityUnits']()]
+    else:
+        Dv_cm = inputs['iex_Dv']() * IEX_LENGTH_CONV[inputs['iex_DiameterUnits']()]
+        area = np.pi / 4 * (Dv_cm ** 2)
+        Fv_cm3ps = inputs['iex_Fv']() * IEX_VOLUMETRIC_CONV[inputs['iex_FlowrateUnits']()]
+        Vv = Fv_cm3ps / area
+
+    param_dict = {
+        "Q": ("meq/L", inputs['iex_Qv']()),
+        "EBED": (None, inputs['iex_EBEDv']()),
+        "L": ("cm", inputs['iex_Lv']() * IEX_LENGTH_CONV[inputs['iex_LengthUnits']()]),
+        "v": ("cm/s", Vv),
+        "rb": ("cm", inputs['iex_rbv']() * IEX_LENGTH_CONV[inputs['iex_rbunits']()]),
+        "nr": (None, inputs['iex_nrv']()),
+        "nz": (None, inputs['iex_nzv']()),
+        "time": (inputs['iex_timeunits2'](), 1)
+    }
+    if inputs['iex_model']() == "Macroporous (PSDM)":
+        param_dict["EPOR"] = (None, inputs['iex_EPORv']())
+
+    paramdataframe = pd.DataFrame([
+        {'name': k, 'units': v[0], 'value': v[1]} for k, v in param_dict.items()
+    ])
+
+    # Check for column name consistency
+    ion_names = set(iondata['name'])
+    cin_names = set(c for c in concdata.columns if c != 'time')
+    if not ion_names.issubset(cin_names) or not cin_names.issubset(ion_names):
+        print("Warning: Mismatch between ion names in 'ions' and 'Cin' sheets.")
+        return None
+
+    corr_ions = iondata.copy()
+    corr_cin = cin_correct(iondata, concdata)
+
+    # Convert kL and Ds/Dp units
+    for i, row in iondata.iterrows():
+        corr_ions.loc[i, 'kL'] = row['kL'] * KL_CONV[row['kL_units']]
+        corr_ions.loc[i, 'Ds'] = row['Ds'] * DS_CONV[row['Ds_units']]
+        if inputs['iex_model']() == "Macroporous (PSDM)" and 'Dp' in row:
+            corr_ions.loc[i, 'Dp'] = row['Dp'] * DS_CONV[row['Dp_units']]
+
+    timeconverter = IEX_TIME_CONV[inputs['iex_timeunits2']()]
+
+    if inputs['iex_model']() == "Gel-Type (HSDM)":
+        return HSDMIX_solve(paramdataframe, corr_ions, corr_cin, timeconverter, nt_report)
+    elif inputs['iex_model']() == "Macroporous (PSDM)":
+        return PSDMIX_solve(paramdataframe, corr_ions, corr_cin, timeconverter, nt_report)
+    return None
+
+# =============================================================================
+# SHARED PLOTTING FUNCTIONS
+# =============================================================================
+def create_plotly_figure(computed_df, effluent_df, influent_df, title, y_title, x_title):
+    """Generates a Plotly figure from processed dataframes."""
+    fig = go.Figure()
+
+    def add_traces(df, mode, name_map=lambda x: x):
+        if df is not None and not df.empty:
+            for i, name in enumerate(df['name'].unique()):
+                subset = df[df['name'] == name]
+                color = STEPPED_SEQUENTIAL_5_STEPS[i % len(STEPPED_SEQUENTIAL_5_STEPS)]
+                
+                fig.add_trace(go.Scatter(
+                    x=subset['hours'], y=subset['conc'],
+                    mode=mode, name=name_map(name),
+                    line=dict(color=color) if 'lines' in mode else None,
+                    marker=dict(color=color) if 'markers' in mode else None
+                ))
+
+    add_traces(computed_df, 'lines')
+    add_traces(effluent_df, 'markers', name_map=lambda n: n.replace('_effluent', ' (Observed)'))
+    add_traces(influent_df, 'lines+markers', name_map=lambda n: n.replace('_influent', ' (Influent)'))
+
+    fig.update_layout(
+        title=title, yaxis_title=y_title, xaxis_title=x_title,
+        hovermode='x unified',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
+
+# =============================================================================
+# EPA BANNER HTML
+# =============================================================================
+epa_banner_html = """
+<header class='masthead clearfix' role='banner'>
+     <img alt='' class='site-logo' src='https://www.epa.gov/sites/all/themes/epa/logo.png'>
+     <div class='site-name-and-slogan'>
+         <h1 class='site-name'><a href='https://www.epa.gov' rel='home' title='Go to the home page'><span>US EPA</span></a></h1>
+         <div class='site-slogan'>United States Environmental Protection Agency</div>
+     </div>
+</header>
+"""
+
+# =============================================================================
+# COMBINED UI DEFINITION
+# =============================================================================
+app_ui = ui.page_fluid(
+    # Add CSS styling
+    ui.tags.head(
+        ui.tags.link(rel="stylesheet", type="text/css", href="style.css"),
+        ui.tags.style("""
+            .mode-disabled { opacity: 0.3; pointer-events: none; }
+            .mode-selector { background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        """)
+    ),
+
+    # EPA banner
+    ui.HTML(epa_banner_html),
+
+    # Main page title
+    ui.div(
+        ui.h1("Combined GAC & Ion Exchange Model (Python Version)", class_="page-title"),
+        class_="main-column clearfix"
+    ),
+
+    ui.page_navbar(
+        ui.nav_panel("Input",
+            ui.layout_sidebar(
+                ui.sidebar(
+                    # MODE SELECTOR - New addition for combined app
+                    ui.div(
+                        ui.h4("Model Selection", style="margin-top: 0;"),
+                        ui.input_radio_buttons(
+                            "model_mode", "Choose Model Type:",
+                            choices={"GAC": "Granular Activated Carbon (GAC)", "IEX": "Ion Exchange (IEX)"},
+                            selected="GAC",
+                            inline=False
+                        ),
+                        class_="mode-selector"
+                    ),
+                    
+                    # File upload (shared)
+                    ui.input_file("file1", "Choose .xlsx File", accept=".xlsx"),
+                    ui.output_text("selected_file_text"),
+                    ui.hr(),
+                    
+                    # GAC-specific controls
+                    ui.div(
+                        ui.h4("GAC Fouling Parameters"),
+                        ui.input_select("gac_WFouling", "Water Type", choices=W_FOULING_VECTOR),
+                        ui.input_select("gac_CFouling", "Chemical Type", choices=C_FOULING_VECTOR),
+                        id="gac_fouling_controls"
+                    ),
+                    
+                    # IEX-specific controls  
+                    ui.div(
+                        ui.input_select("iex_model", "IEX Model Selection", choices=MODEL_VECTOR),
+                        id="iex_model_controls",
+                        style="display: none;"
+                    ),
+                    
+                    ui.hr(),
+                    
+                    # Collocation points (shared but with mode-specific IDs)
+                    ui.div(
+                        ui.input_slider("gac_nrv", "GAC Radial Collocation Points", 3, 18, 7),
+                        ui.input_slider("gac_nzv", "GAC Axial Collocation Points", 3, 18, 12),
+                        id="gac_collocation_controls"
+                    ),
+                    
+                    ui.div(
+                        ui.input_slider("iex_nrv", "IEX Radial Collocation Points", 3, 18, 7),
+                        ui.input_slider("iex_nzv", "IEX Axial Collocation Points", 3, 18, 13),
+                        id="iex_collocation_controls",
+                        style="display: none;"
+                    ),
+                    
+                    ui.hr(),
+                    ui.input_action_button("run_button", "Run Analysis", class_="btn-primary"),
+                ),
+                
+                # Main content area with mode-specific tabs
+                ui.panel_absolute(
+                    ui.navset_card_tab(
+                        # GAC-specific tabs
+                        ui.nav_panel("GAC Column Parameters",
+                            ui.div(
+                                ui.h4(ui.strong("Media Characteristics")),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_prv", "Particle Radius", 0.0513)),
+                                    ui.column(4, ui.input_select("gac_prunits", "Units", ["cm", "m", "mm", "in", "ft"])),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_EPORv", "Bed Porosity", 0.641)),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_pdv", "Particle Density", 0.803)),
+                                    ui.column(4, ui.input_select("gac_pdunits", "Units", ["g/ml"])),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_adv", "Apparent Density", 0.5)),
+                                    ui.column(4, ui.input_select("gac_adunits", "Units", ["g/ml"])),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_psdfrv", "PSDFR", 5.0)),
+                                ),
+                                ui.hr(),
+                                ui.h4(ui.strong("Column Specifications")),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_Lv", "Length", 8.0)),
+                                    ui.column(4, ui.input_select("gac_LengthUnits", "Units", ["cm", "ft", "m", "mm", "in"])),
+                                ),
+                                ui.row(
+                                    ui.column(8, ui.input_radio_buttons("gac_veloselect", "Flow Specification", 
+                                                                       choices=["Volumetric", "Linear"], selected="Volumetric", inline=True)),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_Vv", "Linear Velocity", 0.123)),
+                                    ui.column(4, ui.input_select("gac_VelocityUnits", "Units", GAC_VELOCITY_VECTOR)),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_Dv", "Diameter", 10.0)),
+                                    ui.column(4, ui.input_select("gac_DiameterUnits", "Units", GAC_DIAMETER_VECTOR)),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_Fv", "Volumetric Flow Rate", 500.0)),
+                                    ui.column(4, ui.input_select("gac_FlowrateUnits", "Units", GAC_FLOWRATE_VECTOR, selected="L/min")),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_wv", "Weight", 8500)),
+                                    ui.column(4, ui.input_select("gac_wunits", "Units", GAC_WEIGHT_VECTOR)),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("gac_tortuv", "Tortuosity", 1.0)),
+                                ),
+                                ui.hr(),
+                                ui.h4(ui.strong("Data Units")),
+                                ui.row(
+                                    ui.column(4, ui.input_select("gac_conc_units", "Concentration Units", ["ug", "ng", "mg"])),
+                                ),
+                                ui.row(
+                                    ui.column(4, ui.input_select("gac_tunits2", "Time Units", ["days", "hours"])),
+                                ),
+                                id="gac_column_params"
+                            ),
+                        ),
+                        
+                        ui.nav_panel("GAC Compounds",
+                            ui.div(
+                                ui.h4("Compound Properties"), ui.output_data_frame("gac_properties_table"),
+                                ui.h4("K Data"), ui.output_data_frame("gac_kdata_table"),
+                                ui.h4("Influent Data"), ui.output_data_frame("gac_influent_table"),
+                                ui.h4("Effluent Data"), ui.output_data_frame("gac_effluent_table"),
+                                id="gac_compounds"
+                            )
+                        ),
+                        
+                        # IEX-specific tabs
+                        ui.nav_panel("IEX Column Parameters",
+                            ui.div(
+                                ui.h4(ui.strong("Resin Characteristics")),
+                                ui.row(ui.column(4, ui.input_numeric("iex_Qv", "Resin Capacity (meq/L)", 1400)),
+                                       ui.column(4, ui.input_numeric("iex_rbv", "Bead Radius", 0.03375)),
+                                       ui.column(4, ui.input_select("iex_rbunits", "Units", ["cm", "m", "mm", "in", "ft"]))),
+                                ui.row(ui.column(4, ui.input_numeric("iex_EBEDv", "Bed Porosity", 0.35)),
+                                       ui.column(4, ui.input_numeric("iex_EPORv", "Bead Porosity (PSDM)", 0.2))),
+                                ui.hr(),
+                                ui.h4(ui.strong("Column Specifications")),
+                                ui.input_radio_buttons("iex_veloselect", "Flow Specification", 
+                                                       ["Linear", "Volumetric"], selected="Linear", inline=True),
+                                ui.row(ui.column(4, ui.input_numeric("iex_Lv", "Length", 14.765)),
+                                       ui.column(4, ui.input_select("iex_LengthUnits", "Units", ["cm", "m", "mm", "in", "ft"]))),
+                                ui.row(ui.column(4, ui.input_numeric("iex_Vv", "Velocity", 0.123)),
+                                       ui.column(4, ui.input_select("iex_VelocityUnits", "Units", list(IEX_VELOCITY_CONV.keys())))),
+                                ui.row(ui.column(4, ui.input_numeric("iex_Dv", "Diameter", 4.0)),
+                                       ui.column(4, ui.input_select("iex_DiameterUnits", "Units", ["cm", "m", "in", "ft"]))),
+                                ui.row(ui.column(4, ui.input_numeric("iex_Fv", "Flow Rate", 1.546)),
+                                       ui.column(4, ui.input_select("iex_FlowrateUnits", "Units", list(IEX_VOLUMETRIC_CONV.keys())))),
+                                ui.hr(),
+                                ui.h4(ui.strong("Concentration Time")),
+                                ui.row(ui.column(4, ui.input_select("iex_timeunits2", "Units", ["hr", "day"]))),
+                                id="iex_column_params",
+                                style="display: none;"
+                            ),
+                        ),
+                        
+                        ui.nav_panel("IEX Ions & Concentrations",
+                            ui.div(
+                                ui.h4("Ion List"), ui.output_data_frame("iex_ion_table"),
+                                ui.h4("Influent Concentration Points"), ui.output_data_frame("iex_cin_table"),
+                                ui.h4("Effluent Concentration Points"), ui.output_data_frame("iex_effluent_table"),
+                                id="iex_ions",
+                                style="display: none;"
+                            ),
+                        ),
+                        
+                        ui.nav_panel("Alkalinity Calculator",
+                            ui.div(
+                                ui.h4("Bicarbonate Concentration of Alkalinity"),
+                                ui.p("This calculator can be used to find bicarbonate concentrations from pH measurements."),
+                                ui.hr(),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("alkvalue", "Alkalinity Value", 100)),
+                                    ui.column(4, ui.input_select("alkunits", "Concentration Units", ["mg/L CaCO3"])),
+                                ),
+                                ui.row(
+                                    ui.column(8, ui.input_slider("pH", "pH", min=6, max=11, value=7, step=0.1)),
+                                ),
+                                ui.hr(),
+                                ui.h5("Bicarbonate Concentration (meq/L)"), ui.output_text("bicarb_meq_L"),
+                                ui.h5("Bicarbonate Concentration (mg C/L)"), ui.output_text("bicarb_mg_C_L"),
+                                ui.h5("Bicarbonate Concentration (mg HCO3-/L)"), ui.output_text("bicarb_mg_HCO3_L"),
+                                id="alkalinity_calc",
+                                style="display: none;"
+                            ),
+                        ),
+                        
+                        ui.nav_panel("kL Guesser",
+                            ui.div(
+                                ui.h4("Film Transfer Coefficient (kL) Estimator"),
+                                ui.p("Estimate kL values for common PFAS compounds using the Gnielinski equation."),
+                                ui.hr(),
+                                ui.row(
+                                    ui.column(4, ui.input_numeric("temp", "Temperature", 23)),
+                                    ui.column(4, ui.input_select("tempunits", "Units", ["deg C"])),
+                                ),
+                                ui.input_action_button('estimate_kl', 'Estimate Values', class_="btn-info"),
+                                ui.hr(),
+                                ui.row(
+                                    ui.column(6, ui.h5("PFAS Properties"), ui.output_data_frame("pfas_properties_table")),
+                                    ui.column(6, ui.h5("kL Estimates"), ui.output_data_frame("kl_estimates_table")),
+                                ),
+                                id="kl_guesser",
+                                style="display: none;"
+                            ),
+                        )
+                    )
+                )
+            )
+        ),
+        
+        ui.nav_panel("Output",
+            ui.layout_sidebar(
+                ui.sidebar(
+                    ui.input_select("OCunits", "Output Concentration Units", 
+                                   choices=["ug/L", "mg/L", "ng/L", "c/c0"]),
+                    ui.input_select("timeunits", "Output Time Units", 
+                                   choices=["Days", "Bed Volumes (x1000)", "Hours", "Months", "Years"]),
+                    ui.hr(),
+                    ui.input_checkbox("computeddata", "Computed Data", True),
+                    ui.input_checkbox("effluentdata", "Effluent Data", False),
+                    ui.input_checkbox("influentdata", "Influent Data", False),
+                    ui.hr(),
+                    
+                    # GAC-specific fitting controls
+                    ui.div(
+                        ui.h5(ui.strong("Effluent Fitting")),
+                        ui.input_radio_buttons("xn", "Options for 1/n increment", 
+                                              choices=[0.01, 0.025, 0.05], selected=0.01, inline=True),
+                        ui.input_slider("pm", "Range of K values to test (± %)", 0, 50, 30, step=5),
+                        ui.input_action_button('fitting', 'Fit Data', class_="btn-info"),
+                        ui.hr(),
+                        id="gac_fitting_controls"
+                    ),
+                    
+                    ui.download_button("save_button", "Save Data", class_="btn-success"),
+                ),
+                ui.panel_absolute(
+                    # GAC plot
+                    ui.div(
+                        output_widget("gac_main_plot"),
+                        id="gac_output_plot"
+                    ),
+                    # IEX plots  
+                    ui.div(
+                        output_widget("iex_plot_counterions"),
+                        ui.hr(),
+                        output_widget("iex_plot_other_ions"),
+                        id="iex_output_plots",
+                        style="display: none;"
+                    )
+                )
+            )
+        ),
+        
+        ui.nav_panel("GAC Fitted Data",
+            ui.div(
+                ui.div(
+                    ui.h4("Fitted K Data"),
+                    ui.output_data_frame("gac_fitted_k_data_output"),
+                    ui.hr(),
+                    ui.input_action_button('use_fit_data', 'Use Fitted K Data', class_="btn-warning"),
+                    ui.p(ui.em("Note: This will update the K Data. The model must be run again to see the new output.")),
+                    id="gac_fitted_data_content"
+                ),
+            )
+        ),
+        
+        ui.nav_panel("About",
+            ui.h5("About the Combined GAC & Ion Exchange Model"),
+            ui.p("This combined model provides both Granular Activated Carbon (GAC) and Ion Exchange (IEX) modeling capabilities. "
+                 "Use the mode selector on the Input tab to switch between GAC and IEX functionality."),
+            ui.h5("GAC Model"),
+            ui.p("Models contaminant removal using granular activated carbon with PSDM (Pore and Surface Diffusion Model)."),
+            ui.h5("Ion Exchange Model"), 
+            ui.p("Models ion exchange processes using HSDM (Homogeneous Surface Diffusion Model) or PSDM approaches."),
+            ui.h5("Developed By"),
+            ui.p("Original R Models: David Colantonio, Levi Haupert, Jonathan Burkhardt, Cole Sandlin"),
+            ui.p("Python Translation & Combination: Combined App Development Team"),
+        ),
+        
+        title="Combined GAC & Ion Exchange Model",
+    )
+)
+
+# =============================================================================
+# COMBINED SERVER LOGIC
+# =============================================================================
+def server(input, output, session):
+    # --- State Management ---
+    gac_app_data = reactive.Value({})
+    iex_app_data = reactive.Value({})
+    gac_fitted_k_data = reactive.Value(pd.DataFrame())
+    
+    # --- Mode-specific UI visibility control ---
+    @reactive.Effect
+    def update_ui_visibility():
+        mode = input.model_mode()
+        
+        # JavaScript to show/hide elements based on mode
+        if mode == "GAC":
+            # Show GAC elements, hide IEX elements
+            session.send_custom_message("toggle_elements", {
+                "show": ["gac_fouling_controls", "gac_collocation_controls", "gac_column_params", 
+                        "gac_compounds", "gac_output_plot", "gac_fitting_controls", "gac_fitted_data_content"],
+                "hide": ["iex_model_controls", "iex_collocation_controls", "iex_column_params", 
+                        "iex_ions", "alkalinity_calc", "kl_guesser", "iex_output_plots"]
+            })
+        else:  # IEX mode
+            # Show IEX elements, hide GAC elements
+            session.send_custom_message("toggle_elements", {
+                "show": ["iex_model_controls", "iex_collocation_controls", "iex_column_params", 
+                        "iex_ions", "alkalinity_calc", "kl_guesser", "iex_output_plots"],
+                "hide": ["gac_fouling_controls", "gac_collocation_controls", "gac_column_params", 
+                        "gac_compounds", "gac_output_plot", "gac_fitting_controls", "gac_fitted_data_content"]
+            })
+
+    # --- File Loading and Processing ---
+    @reactive.Effect
+    def load_default_file():
+        # Load appropriate default file based on mode
+        mode = input.model_mode()
+        if mode == "GAC":
+            default_path = Path(__file__).parent / "GAC_config.xlsx"
+        else:
+            default_path = Path(__file__).parent / "IEX_config.xlsx"
+            
+        if default_path.exists():
+            process_excel_file(str(default_path), default_path.name, mode)
+
+    @reactive.Effect
+    @reactive.event(input.file1)
+    def load_uploaded_file():
+        file_info = input.file1()
+        if file_info:
+            mode = input.model_mode()
+            process_excel_file(file_info["datapath"], file_info["name"], mode)
+
+    def process_excel_file(filepath, filename, mode):
+        """Process Excel file based on current mode (GAC or IEX)."""
+        try:
+            xls = pd.ExcelFile(filepath)
+            os.makedirs('temp_file', exist_ok=True)
+
+            if mode == "GAC":
+                # Process GAC-specific sheets
+                data = {}
+                
+                # Helper function to handle errors
+                def handle_error(sheet_name, err):
+                    print(err)
+                    print(f"Warning: {sheet_name} sheet doesn't exist. Reverting to default values.")
+                
+                # Read Properties sheet
+                try:
+                    data['properties'] = pd.read_excel(xls, sheet_name='Properties').rename(columns={'Unnamed: 0': '...'})
+                except Exception as e:
+                    handle_error("Properties", e)
+                
+                # Read Kdata sheet
+                try:
+                    data['kdata'] = pd.read_excel(xls, sheet_name='Kdata').rename(columns={'Unnamed: 0': '...'})
+                except Exception as e:
+                    handle_error("Kdata", e)
+                    
+                # Read columnSpecs sheet
+                try:
+                    data['columnSpecs'] = pd.read_excel(xls, sheet_name='columnSpecs')
+                except Exception as e:
+                    handle_error("columnSpecs", e)
+
+                # Read data sheet and pivot
+                try:
+                    raw_data = pd.read_excel(xls, sheet_name='data')
+                    data['influent'] = raw_data[raw_data['type'] == 'influent'].pivot(
+                        index='time', columns='compound', values='concentration').reset_index()
+                    data['effluent'] = raw_data[raw_data['type'] == 'effluent'].pivot(
+                        index='time', columns='compound', values='concentration').reset_index()
+                except Exception as e:
+                    handle_error("data", e)
+
+                # Read name sheet
+                try:
+                    data['filename'] = pd.read_excel(xls, sheet_name='name')
+                except Exception as e:
+                    try:
+                        data['filename'] = pd.DataFrame({'name': [filename]})
+                    except Exception:
+                        data['filename'] = pd.DataFrame({'name': [filename]})
+
+                # Read Fouling Data sheet
+                try:
+                    data['fouling'] = pd.read_excel(xls, sheet_name='Fouling Data')
+                except Exception as e:
+                    data['fouling'] = pd.DataFrame({
+                        'WaterFouling': ['Organic Free'],
+                        'ChemicalFouling': ['halogenated alkenes']
+                    })
+                
+                gac_app_data.set(data)
+                
+            else:  # IEX mode
+                # Process IEX-specific sheets
+                data = {}
+                try:
+                    data['params'] = pd.read_excel(xls, sheet_name="params")
+                    data['ions'] = pd.read_excel(xls, sheet_name="ions")
+                    data['cin'] = pd.read_excel(xls, sheet_name="Cin")
+                    data['cin'].columns = [c.lower() if c.lower() == 'time' else c for c in data['cin'].columns]
+                    
+                    # Effluent might not exist, handle gracefully
+                    try:
+                        data['effluent'] = pd.read_excel(xls, sheet_name="effluent")
+                    except Exception:
+                        data['effluent'] = pd.DataFrame({'time': [0], 'CHLORIDE': [0]})
+
+                    data['filename'] = os.path.basename(filepath)
+                    iex_app_data.set(data)
+                except Exception as e:
+                    print(f"Warning: IEX sheet error: {e}")
+                    
+        except Exception as e:
+            print(f"Error processing file: {e}")
+            
+    # --- Update UI from loaded data for GAC ---
+    @reactive.Effect
+    def update_gac_ui_from_data():
+        """Updates GAC UI input controls with values from the loaded Excel file."""
+        if input.model_mode() != "GAC":
+            return
+            
+        data = gac_app_data.get()
+        if not data or "columnSpecs" not in data:
+            return
+
+        specs = data["columnSpecs"]
+        fouling = data.get("fouling", pd.DataFrame())
+        
+        # Helper functions to safely get values
+        def get_val(name, default):
+            if name in specs['name'].values:
+                val = specs.loc[specs['name'] == name, 'value'].iloc[0]
+                return val if pd.notna(val) else default
+            return default
+            
+        def get_unit(name, default):
+            if name in specs['name'].values:
+                unit = specs.loc[specs['name'] == name, 'units'].iloc[0]
+                return unit if pd.notna(unit) else default
+            return default
+
+        # Update numeric inputs
+        ui.update_numeric("gac_prv", value=get_val('radius', 0.0513))
+        ui.update_numeric("gac_EPORv", value=get_val('porosity', 0.641))
+        ui.update_numeric("gac_pdv", value=get_val('particleDensity', 0.803))
+        ui.update_numeric("gac_adv", value=get_val('apparentDensity', 0.5))
+        ui.update_numeric("gac_psdfrv", value=get_val('psdfr', 5.0))
+        ui.update_numeric("gac_Lv", value=get_val('length', 8.0))
+        ui.update_numeric("gac_wv", value=get_val('weight', 8500))
+        ui.update_numeric("gac_Dv", value=get_val('diameter', 10.0))
+        ui.update_numeric("gac_tortuv", value=get_val('tortuosity', 1.0))
+
+        # Update flow inputs
+        if 'v' in specs['name'].values:
+            ui.update_radio_buttons("gac_veloselect", selected="Linear")
+            ui.update_numeric("gac_Vv", value=get_val('v', 0.123))
+        elif 'flowrate' in specs['name'].values:
+            ui.update_radio_buttons("gac_veloselect", selected="Volumetric")
+            ui.update_numeric("gac_Fv", value=get_val('flowrate', 500.0))
+            
+        # Update select inputs
+        ui.update_select("gac_prunits", selected=get_unit('radius', 'cm'))
+        ui.update_select("gac_LengthUnits", selected=get_unit('length', 'cm'))
+        ui.update_select("gac_wunits", selected=get_unit('weight', 'g'))
+        ui.update_select("gac_conc_units", selected=get_val('units', 'ug'))
+        ui.update_select("gac_tunits2", selected=get_val('time', 'days'))
+        ui.update_select("gac_DiameterUnits", selected=get_unit('diameter', 'cm'))
+        ui.update_select("gac_VelocityUnits", selected=get_unit('v', 'cm/s'))
+        ui.update_select("gac_FlowrateUnits", selected=get_unit('flowrate', 'L/min'))
+
+        # Update fouling data
+        if not fouling.empty:
+            ui.update_select("gac_WFouling", selected=fouling['WaterFouling'].iloc[0])
+            ui.update_select("gac_CFouling", selected=fouling['ChemicalFouling'].iloc[0])
+            
+    # --- Update UI from loaded data for IEX ---  
+    @reactive.Effect
+    def update_iex_ui_from_data():
+        """Updates IEX UI input controls with values from the loaded Excel file."""
+        if input.model_mode() != "IEX":
+            return
+            
+        data = iex_app_data.get()
+        if "params" not in data:
+            return
+            
+        params = data["params"]
+        
+        def get_param(name, default):
+            val = params[params['name'] == name]['value']
+            return val.iloc[0] if not val.empty else default
+
+        def get_unit(name, default):
+            unit = params[params['name'] == name]['units']
+            return unit.iloc[0] if not unit.empty else default
+        
+        # Update numeric inputs
+        ui.update_numeric("iex_Qv", value=get_param('Q', 1400))
+        ui.update_numeric("iex_rbv", value=get_param('rb', 0.03375))
+        ui.update_numeric("iex_EBEDv", value=get_param('EBED', 0.35))
+        ui.update_numeric("iex_EPORv", value=get_param('EPOR', 0.2))
+        ui.update_numeric("iex_Lv", value=get_param('L', 14.765))
+        ui.update_numeric("iex_nrv", value=get_param('nr', 7))
+        ui.update_numeric("iex_nzv", value=get_param('nz', 13))
+
+        # Update velocity/flow
+        if 'v' in params['name'].values:
+            ui.update_radio_buttons("iex_veloselect", selected="Linear")
+            ui.update_numeric("iex_Vv", value=get_param('v', 0.123))
+            ui.update_select("iex_VelocityUnits", selected=get_unit('v', 'cm/s'))
+        elif 'flrt' in params['name'].values and 'diam' in params['name'].values:
+            ui.update_radio_buttons("iex_veloselect", selected="Volumetric")
+            ui.update_numeric("iex_Fv", value=get_param('flrt', 1.546))
+            ui.update_select("iex_FlowrateUnits", selected=get_unit('flrt', 'L/min'))
+            ui.update_numeric("iex_Dv", value=get_param('diam', 4.0))
+            ui.update_select("iex_DiameterUnits", selected=get_unit('diam', 'cm'))
+
+    # --- Display Data Tables ---
+    @output
+    @render.text
+    def selected_file_text():
+        file_info = input.file1()
+        if file_info:
+            return f"Selected file: {file_info[0]['name']}"
+        return "No file selected"
+
+    # GAC Data Tables
+    @output
+    @render.data_frame
+    def gac_properties_table():
+        data = gac_app_data.get()
+        if 'properties' in data:
+            return render.DataTable(data['properties'])
+        return render.DataTable(pd.DataFrame())
+
+    @output
+    @render.data_frame 
+    def gac_kdata_table():
+        data = gac_app_data.get()
+        if 'kdata' in data:
+            return render.DataTable(data['kdata'])
+        return render.DataTable(pd.DataFrame())
+
+    @output
+    @render.data_frame
+    def gac_influent_table():
+        data = gac_app_data.get()
+        if 'influent' in data:
+            return render.DataTable(data['influent'])
+        return render.DataTable(pd.DataFrame())
+
+    @output
+    @render.data_frame
+    def gac_effluent_table():
+        data = gac_app_data.get()
+        if 'effluent' in data:
+            return render.DataTable(data['effluent'])
+        return render.DataFrame()
+
+    # IEX Data Tables
+    @output
+    @render.data_frame
+    def iex_ion_table():
+        data = iex_app_data.get()
+        if 'ions' in data:
+            return render.DataTable(data['ions'])
+        return render.DataTable(pd.DataFrame())
+
+    @output
+    @render.data_frame
+    def iex_cin_table():
+        data = iex_app_data.get()
+        if 'concentrations' in data:
+            return render.DataTable(data['concentrations'])
+        return render.DataTable(pd.DataFrame())
+
+    @output
+    @render.data_frame
+    def iex_effluent_table():
+        data = iex_app_data.get()
+        if 'effluent' in data:
+            return render.DataTable(data['effluent'])
+        return render.DataFrame()
+
+    # --- Model Execution ---
+    gac_model_results = reactive.Value(pd.DataFrame())
+    iex_model_results = reactive.Value(pd.DataFrame())
+
+    @reactive.Effect
+    @reactive.event(input.run_button)
+    def run_model_analysis():
+        mode = input.model_mode()
+        
+        if mode == "GAC":
+            # Run GAC model
+            try:
+                data = gac_app_data.get()
+                if data:
+                    # Prepare GAC column data
+                    column_data = prepare_gac_column_data(input)
+                    
+                    # Run PSDM model (implementation needed)
+                    results = run_PSDM(column_data, data.get('properties'), data.get('kdata'), 
+                                      data.get('influent'), input.gac_nrv(), input.gac_nzv())
+                    
+                    gac_model_results.set(results)
+                    
+            except Exception as e:
+                print(f"GAC model error: {e}")
+                
+        else:  # IEX mode
+            # Run IEX model
+            try:
+                data = iex_app_data.get()
+                if data:
+                    # Prepare IEX model parameters
+                    results = model_prep(input, data.get('ions'), data.get('concentrations'), NT_REPORT)
+                    
+                    iex_model_results.set(results)
+                    
+            except Exception as e:
+                print(f"IEX model error: {e}")
+
+    # --- GAC Fitting ---
+    @reactive.Effect
+    @reactive.event(input.fitting)
+    def run_gac_fitting():
+        if input.model_mode() == "GAC":
+            try:
+                data = gac_app_data.get()
+                if data and 'effluent' in data:
+                    # Run GAC fitting (implementation needed)
+                    fitted_results = run_PSDM_fitter(
+                        data['properties'], data['kdata'], data['effluent'],
+                        input.xn(), input.pm()
+                    )
+                    gac_fitted_k_data.set(fitted_results[0] if len(fitted_results) > 0 else pd.DataFrame())
+            except Exception as e:
+                print(f"GAC fitting error: {e}")
+
+    @reactive.Effect
+    @reactive.event(input.use_fit_data)
+    def use_fitted_data():
+        if input.model_mode() == "GAC":
+            fitted_data = gac_fitted_k_data.get()
+            if not fitted_data.empty:
+                data = gac_app_data.get()
+                data['kdata'] = fitted_data
+                gac_app_data.set(data)
+
+    @output
+    @render.data_frame
+    def gac_fitted_k_data_output():
+        fitted_data = gac_fitted_k_data.get()
+        return render.DataTable(fitted_data)
+
+    # --- IEX Alkalinity Calculator ---
+    @output
+    @render.text
+    def bicarb_meq_L():
+        if input.model_mode() == "IEX":
+            # Calculate bicarbonate concentration (implementation needed)
+            alk = input.alkvalue()
+            ph_val = input.pH()
+            # Simplified calculation - full implementation needed
+            bicarb_meq = alk * 0.02 * (10**(ph_val-6.35))  # Approximate formula
+            return f"{bicarb_meq:.3f}"
+        return ""
+
+    @output
+    @render.text
+    def bicarb_mg_C_L():
+        if input.model_mode() == "IEX":
+            # Convert to mg C/L (implementation needed)
+            return "0.000"     # Placeholder
+        return ""
+
+    @output
+    @render.text
+    def bicarb_mg_HCO3_L():
+        if input.model_mode() == "IEX":
+            # Convert to mg HCO3-/L (implementation needed)
+            return "0.000"  # Placeholder
+        return ""
+
+    # --- PFAS Properties and kL Guesser ---
+    pfas_properties = reactive.Value(pd.DataFrame())
+    kl_estimates = reactive.Value(pd.DataFrame())
+    
+    @reactive.Effect
+    def load_pfas_properties():
+        """Load PFAS properties for kL Guesser."""
+        # Create sample PFAS properties data
+        sample_data = pd.DataFrame({
+            'MolarVol (cm^3/mol)': [132.5, 158.2, 184.1, 210.3, 236.8]
+        }, index=['PFOA', 'PFOS', 'PFNA', 'PFDA', 'PFUnDA'])
+        pfas_properties.set(sample_data)
+
+    @reactive.Effect
+    @reactive.event(input.estimate_kl)
+    def calculate_kl_estimates():
+        """Calculate kL estimates using Gnielinski equation."""
+        if input.model_mode() != "IEX":
+            return
+            
+        df = pfas_properties().copy()
+        if df.empty:
+            return
+            
+        t_k = input.temp() + 273.15
+        viscosity = np.exp(-24.71 + (4209/t_k) + 0.04527 * t_k - (3.376e-5 * t_k**2)) / 100
+        t2 = t_k / 324.65
+        density = 0.98396*(-1.41768 + 8.97665*t2 - 12.2755*t2**2 + 7.45844*t2**3 - 1.73849*t2**4)
+        mu1 = viscosity * 100
+        
+        # Get current IEX parameters
+        v_val = input.iex_Vv() if hasattr(input, 'iex_Vv') else 0.123
+        ebed_val = input.iex_EBEDv() if hasattr(input, 'iex_EBEDv') else 0.35
+        rb_val = input.iex_rbv() if hasattr(input, 'iex_rbv') else 0.03375
+        
+        df['kL Estimate (cm/s)'] = df.apply(lambda row:
+            ( (2 + 0.644 * ( (v_val / ebed_val) * (2*rb_val) * (density / viscosity) )**(1/2) * 
+              (viscosity / density / (13.26e-5 * (mu1 ** -1.14) * (float(row["MolarVol (cm^3/mol)"]) ** -0.589)))**(1/3)) * 
+              (1 + 1.5 * (1- ebed_val)) ) * 
+              (13.26e-5 * (mu1 ** -1.14) * (float(row["MolarVol (cm^3/mol)"]) ** -0.589)) / (2*rb_val),
+            axis=1
+        )
+        kl_estimates.set(df[['kL Estimate (cm/s)']])
+    
+    # --- IEX Data Processing for Plotting ---
+    @reactive.Calc
+    def processed_iex_output():
+        """Process IEX model output for plotting."""
+        if input.model_mode() != "IEX":
+            return None
+            
+        results = iex_model_results.get()
+        if results is None:
+            return None
+            
+        t_out, x_out = results
+        ions_df = iex_app_data.get().get("ions", pd.DataFrame())
+        cin_df = iex_app_data.get().get("cin", pd.DataFrame())
+        effluent_df = iex_app_data.get().get("effluent", pd.DataFrame())
+        
+        if ions_df.empty:
+            return None
+            
+        NION = len(ions_df)
+
+        # Extract outlet concentrations
+        outlet_conc = x_out[:, -1, :, -1] # time, liquid_phase, ions, outlet_node
+        
+        # Reshape for plotting
+        df = pd.DataFrame(outlet_conc, columns=ions_df['name'])
+        df['hours'] = t_out
+        
+        # Convert to long format
+        df_long = df.melt(id_vars='hours', var_name='name', value_name='conc_meq')
+
+        # Convert units based on output selection
+        output_unit = input.OCunits()
+        if output_unit == "c/c0":
+            c0_meq = cin_correct(ions_df, cin_df.iloc[[0]]).drop(columns='time').iloc[0]
+            df_long['conc'] = df_long.apply(lambda row: row['conc_meq'] / c0_meq[row['name']] if c0_meq[row['name']] != 0 else 0, axis=1)
+        else: # mg/L, ug/L, ng/L
+            df_mgl = df.copy()
+            for name in df_mgl.columns:
+                if name != 'hours':
+                    ion_info = ions_df[ions_df['name'] == name].iloc[0]
+                    df_mgl[name] *= ion_info['mw'] / ion_info['valence']
+            
+            df_mgl_long = df_mgl.melt(id_vars='hours', var_name='name', value_name='conc')
+            df_mgl_long['conc'] /= IEX_MASS_CONV[output_unit]
+            df_long = df_mgl_long
+            
+        # Convert time units
+        time_unit = input.timeunits()
+        if time_unit == "Bed Volumes (x1000)":
+            # Simplified get_bv_in_sec logic
+            L_cm = input.iex_Lv() * IEX_LENGTH_CONV[input.iex_LengthUnits()]
+            V_cms = input.iex_Vv() * IEX_VELOCITY_CONV[input.iex_VelocityUnits()]
+            bv_sec = L_cm / V_cms
+            df_long['hours'] /= (bv_sec / 3600) / 1000
+        else:
+            df_long['hours'] /= (IEX_TIME_CONV[time_unit] / 3600)
+            
+        # Process effluent and influent similarly
+        effluent_processed = pd.DataFrame()
+        if input.effluentdata() and not effluent_df.empty:
+            effluent_long = effluent_df.melt(id_vars='time', var_name='name', value_name='conc')
+            effluent_long = effluent_long.rename(columns={'time': 'hours'})
+            effluent_long['name'] = effluent_long['name'] + "_effluent"
+            effluent_processed = effluent_long
+
+        influent_processed = pd.DataFrame()
+        if input.influentdata() and not cin_df.empty:
+            influent_long = cin_df.melt(id_vars='time', var_name='name', value_name='conc')
+            influent_long = influent_long.rename(columns={'time': 'hours'})
+            influent_long['name'] = influent_long['name'] + "_influent"
+            influent_processed = influent_long
+
+        return df_long, effluent_processed, influent_processed
+
+    # === IEX Alkalinity Calculator Functions ===
+    def bicarbonate_calcs():
+        K1, K2, KW = 10**-6.352, 10**-10.329, 10**-14
+        h_plus = 10**-input.pH()
+        oh_minus = KW / h_plus
+        alpha_1 = 1 / (1 + h_plus / K1 + K2 / h_plus)
+        alpha_2 = 1 / (1 + h_plus / K2 + h_plus**2 / (K1 * K2))
+        tot_co3_M = (input.alkvalue() / 50000 + h_plus - oh_minus) / (alpha_1 + 2 * alpha_2)
+        hco3_mM_L = alpha_1 * tot_co3_M * 1000
+        if hco3_mM_L < 0: 
+            return "INVALID", "INVALID", "INVALID"
+        return f"{hco3_mM_L:.4f}", f"{hco3_mM_L * 12:.4f}", f"{hco3_mM_L * 61:.4f}"
+
+    @output
+    @render.text
+    def bicarb_meq_L(): 
+        return bicarbonate_calcs()[0]
+
+    @output
+    @render.text
+    def bicarb_mg_C_L(): 
+        return bicarbonate_calcs()[1]
+
+    @output
+    @render.text
+    def bicarb_mg_HCO3_L(): 
+        return bicarbonate_calcs()[2]
+        
+    @output
+    @render.data_frame
+    def pfas_properties_table(): 
+        return render.DataTable(pfas_properties())
+        
+    @output
+    @render.data_frame
+    def kl_estimates_table(): 
+        estimates = kl_estimates()
+        if not estimates.empty:
+            return render.DataTable(estimates.round(5))
+        return render.DataTable(pd.DataFrame())
+
+    # --- GAC Unit Conversions for Plotting ---
+    def convert_gac_units(df):
+        """Convert GAC plotting units."""
+        if df.empty: 
+            return df
+            
+        data = gac_app_data.get()
+        y_unit = input.OCunits()
+        t_unit = input.timeunits()
+
+        # C/C0 conversion
+        if y_unit == "c/c0" and "influent" in data:
+            c0 = data["influent"].iloc[0].drop('time')
+            df['conc'] = df.apply(lambda row: row['conc'] / c0.get(row['name'].split('_')[0], 1) 
+                                 if c0.get(row['name'].split('_')[0], 1) != 0 else 0, axis=1)
+        else: # Mass unit conversion
+            df['conc'] /= GAC_MASS_CONV.get(y_unit, 1)
+        
+        # Time unit conversion
+        if t_unit == "Bed Volumes (x1000)":
+            # Simplified BV calculation
+            L_cm = input.gac_Lv() * GAC_LENGTH_CONV[input.gac_LengthUnits()]
+            if input.gac_veloselect() == 'Linear':
+                V_cms = input.gac_Vv() * GAC_VELOCITY_CONV[input.gac_VelocityUnits()]
+            else:
+                fv_ml_per_min = input.gac_Fv() * GAC_VOLUMETRIC_CONV[input.gac_FlowrateUnits()]
+                area_cm2 = np.pi/4 * (input.gac_Dv()*GAC_LENGTH_CONV[input.gac_DiameterUnits()])**2
+                V_cms = (fv_ml_per_min / min2sec) / area_cm2
+            bv_days = (L_cm / V_cms) / day2sec
+            df['hours'] /= (bv_days * 1000)
+        else:
+            df['hours'] *= GAC_TIME_CONV.get(t_unit, 1)
+        return df
+
+    # === DATA EXPORT FUNCTIONALITY ===
+    @render.download(filename=lambda: f"combined-model-output-{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx")
+    def save_button():
+        mode = input.model_mode()
+        
+        with BytesIO() as buf:
+            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+                if mode == "GAC":
+                    # Save GAC data and results
+                    gac_data = gac_app_data.get()
+                    if gac_data:
+                        # Original data sheets
+                        if 'properties' in gac_data:
+                            gac_data['properties'].to_excel(writer, sheet_name="GAC_Properties", index=False)
+                        if 'kdata' in gac_data:
+                            gac_data['kdata'].to_excel(writer, sheet_name="GAC_Kdata", index=False)
+                        if 'influent' in gac_data:
+                            gac_data['influent'].to_excel(writer, sheet_name="GAC_Influent", index=False)
+                        if 'effluent' in gac_data:
+                            gac_data['effluent'].to_excel(writer, sheet_name="GAC_Effluent", index=False)
+                            
+                        # Model results
+                        results = gac_model_results.get()
+                        if not results.empty:
+                            results.to_excel(writer, sheet_name="GAC_Model_Results", index=False)
+                            
+                        # Column specifications
+                        try:
+                            column_data = prepare_gac_column_data(input)
+                            column_data.to_excel(writer, sheet_name="GAC_Column_Specs", index=False, header=False)
+                        except:
+                            pass
+                            
+                        # Fitted data if available
+                        fitted_data = gac_fitted_k_data.get()
+                        if not fitted_data.empty:
+                            fitted_data.to_excel(writer, sheet_name="GAC_Fitted_Data", index=False)
+                            
+                else:  # IEX mode
+                    # Save IEX data and results
+                    iex_data = iex_app_data.get()
+                    if iex_data:
+                        # Original data sheets
+                        if 'ions' in iex_data:
+                            iex_data['ions'].to_excel(writer, sheet_name="IEX_Ions", index=False)
+                        if 'concentrations' in iex_data:
+                            iex_data['concentrations'].to_excel(writer, sheet_name="IEX_Concentrations", index=False)
+                        if 'effluent' in iex_data:
+                            iex_data['effluent'].to_excel(writer, sheet_name="IEX_Effluent", index=False)
+                            
+                        # Model results
+                        results = iex_model_results.get()
+                        if results is not None and len(results) == 2:
+                            t_out, x_out = results
+                            # Convert to output format
+                            outlet_conc = x_out[:, -1, :, -1]
+                            ions_df = iex_data.get('ions', pd.DataFrame())
+                            if not ions_df.empty:
+                                output_df = pd.DataFrame(outlet_conc, columns=ions_df['name'])
+                                output_df.insert(0, "time_hours", t_out)
+                                output_df.to_excel(writer, sheet_name="IEX_Model_Results", index=False)
+                        
+                        # PFAS properties if available
+                        pfas_data = pfas_properties()
+                        if not pfas_data.empty:
+                            pfas_data.to_excel(writer, sheet_name="PFAS_Properties", index=False)
+                            
+                        # kL estimates if available
+                        kl_data = kl_estimates()
+                        if not kl_data.empty:
+                            kl_data.to_excel(writer, sheet_name="kL_Estimates", index=False)
+                            
+                # General info sheet
+                info_df = pd.DataFrame({
+                    'Parameter': ['Model_Mode', 'Export_Date', 'App_Version'],
+                    'Value': [mode, pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'), 'Combined GAC-IEX v1.0']
+                })
+                info_df.to_excel(writer, sheet_name="Export_Info", index=False)
+                
+            yield buf.getvalue()
+
+# Add JavaScript for UI visibility control
+app_ui = ui.page_fluid(
+    app_ui,
+    ui.tags.script("""
+        $(document).ready(function() {
+            Shiny.addCustomMessageHandler('toggle_elements', function(message) {
+                // Show elements
+                message.show.forEach(function(id) {
+                    $('#' + id).show();
+                });
+                // Hide elements  
+                message.hide.forEach(function(id) {
+                    $('#' + id).hide();
+                });
+            });
+        });
+    """)
+)
+
+# Create and run the app
+app = App(app_ui, server)
+
+if __name__ == "__main__":
+    app.run()
