@@ -149,7 +149,7 @@ def prepare_gac_column_data(inputs):
         "value": ['Carbon', inputs["gac_prv"]() * GAC_LENGTH_CONV[inputs["gac_prunits"]()],
                   inputs["gac_EPORv"](), inputs["gac_psdfrv"](), inputs["gac_pdv"](),
                   inputs["gac_adv"](), inputs["gac_Lv"]() * GAC_LENGTH_CONV[inputs["gac_LengthUnits"]()],
-                  inputs["gac_wv"]() * GAC_WEIGHT_CONV[inputs["gac_wunits"]()], fv_ml_per_min,
+                  inputs["gac_wv"]() * GAC_WEIGHT_CONV[inputs["gac_wunits"]], fv_ml_per_min,
                   inputs["gac_Dv"]() * GAC_LENGTH_CONV[inputs["gac_DiameterUnits"]()],
                   inputs["gac_tortuv"](), 'influent', 'Carbon', inputs["gac_conc_units"](),
                   inputs["gac_timeunits"](), mass_mult, 'ml', 0.001, t_mult]
@@ -597,8 +597,8 @@ def model_prep(inputs, iondata, concdata, nt_report):
         "L": ("cm", inputs['iex_Lv']() * IEX_LENGTH_CONV[inputs['iex_LengthUnits']()]),
         "v": ("cm/s", Vv),
         "rb": ("cm", inputs['iex_rbv']() * IEX_LENGTH_CONV[inputs['iex_rbunits']()]),
-        "nr": (None, inputs['iex_nrv']()),
-        "nz": (None, inputs['iex_nzv']()),
+        "nr": (None, inputs['nrv']()),
+        "nz": (None, inputs['nzv']()),
         "time": (inputs['iex_timeunits2'](), 1)
     }
     if inputs['iex_model']() == "Macroporous (PSDM)":
@@ -665,33 +665,171 @@ def create_plotly_figure(computed_df, effluent_df, influent_df, title, y_title, 
     return fig
 
 # =============================================================================
-# EPA BANNER HTML
-# =============================================================================
-epa_banner_html = """
-<header class='masthead clearfix' role='banner'>
-     <img alt='' class='site-logo' src='https://www.epa.gov/sites/all/themes/epa/logo.png'>
-     <div class='site-name-and-slogan'>
-         <h1 class='site-name'><a href='https://www.epa.gov' rel='home' title='Go to the home page'><span>US EPA</span></a></h1>
-         <div class='site-slogan'>United States Environmental Protection Agency</div>
-     </div>
-</header>
-"""
-
-# =============================================================================
 # COMBINED UI DEFINITION
 # =============================================================================
 app_ui = ui.page_fluid(
-    # Add CSS styling
+    # Add CSS styling and JavaScript for mode switching
     ui.tags.head(
         ui.tags.link(rel="stylesheet", type="text/css", href="style.css"),
         ui.tags.style("""
-            .mode-disabled { opacity: 0.3; pointer-events: none; }
             .mode-selector { background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+            
+            /* Hide all mode-specific elements by default */
+            .gac-only, .iex-only {
+                display: none;
+            }
+            
+            /* Show mode-specific elements based on body class */
+            body.gac-mode .gac-only {
+                display: block;
+            }
+            
+            body.iex-mode .iex-only {
+                display: block;
+            }
+            
+            /* Hide non-applicable output sections */
+            body.gac-mode #iex_output_plots {
+                display: none !important;
+            }
+            
+            body.iex-mode #gac_output_plot {
+                display: none !important;
+            }
+            
+            body.gac-mode #gac_output_plot, 
+            body.iex-mode #iex_output_plots {
+                display: block !important;
+            }
+            
+            /* Force hide sidebar controls based on mode */
+            body.gac-mode #iex_model_controls,
+            body.iex-mode #gac_fouling_controls {
+                display: none !important;
+            }
+            
+            /* Hide tabs based on mode */
+            body.gac-mode .nav-item a[data-value="IEX Ions & Concentrations"],
+            body.gac-mode .nav-item a[data-value="Alkalinity Calculator"],
+            body.iex-mode .nav-item a[data-value="GAC Compounds"],
+            body.iex-mode .nav-item a[data-value="kL Guesser"],
+            body.iex-mode .nav-item a[data-value="GAC Fitted Data"] {
+                display: none !important;
+            }
+            
+            /* Hide tab content based on mode */
+            body.gac-mode .tab-pane[data-value="IEX Ions & Concentrations"],
+            body.gac-mode .tab-pane[data-value="Alkalinity Calculator"],
+            body.iex-mode .tab-pane[data-value="GAC Compounds"],
+            body.iex-mode .tab-pane[data-value="kL Guesser"],
+            body.iex-mode .tab-pane[data-value="GAC Fitted Data"] {
+                display: none !important;
+            }
+        """),
+        ui.tags.script("""
+        $(function() {
+            // Set initial state - assume GAC mode as default
+            $('body').addClass('gac-mode');
+            console.log("Initial UI setup - setting default class: gac-mode");
+            
+            // Direct DOM manipulation for radio buttons - this is a workaround
+            // to ensure that change events are properly triggered
+            $(document).on('change', 'input[name="model_mode"]', function() {
+                var mode = $(this).val();
+                console.log("Mode changed via direct DOM event:", mode);
+                
+                // Send a Shiny custom message to trigger the server-side update
+                Shiny.setInputValue('model_mode_changed', mode + "_" + new Date().getTime());
+                
+                // Also directly update the regular input value to ensure server-side handlers run
+                Shiny.setInputValue('model_mode', mode);
+            });
+            
+            // Handler for updating body class
+            Shiny.addCustomMessageHandler('update_body_class', function(message) {
+                console.log("Received update_body_class message:", message);
+                $('body').removeClass('gac-mode iex-mode').addClass(message.addClass);
+                console.log("Updated body classes to:", message.addClass);
+            });
+            
+            // Handler for updating tab visibility and UI controls
+            Shiny.addCustomMessageHandler('update_tab_visibility', function(message) {
+                console.log("Received update_tab_visibility message:", message);
+                
+                // Show elements that should be visible
+                $(message.show.join(',')).each(function() {
+                    var $el = $(this);
+                    var selector = $el.selector || (this.tagName ? this.tagName.toLowerCase() : '');
+                    console.log("Showing element:", selector, $el.attr('id') || '', $el.attr('data-value') || '');
+                    
+                    if ($el.is('a[data-value]')) {
+                        // It's a tab link, show its parent li
+                        console.log("  - Showing tab:", $el.attr('data-value'));
+                        $el.parent().show();
+                    } else {
+                        // It's a control container, show it directly
+                        console.log("  - Showing container:", $el.attr('id') || selector);
+                        $el.show();
+                    }
+                });
+                
+                // Hide elements that should be hidden
+                $(message.hide.join(',')).each(function() {
+                    var $el = $(this);
+                    
+                    if ($el.is('a[data-value]')) {
+                        // It's a tab link, hide its parent li
+                        console.log("  - Hiding tab:", $el.attr('data-value'));
+                        $el.parent().hide();
+                        
+                        // If this tab is active, we need to switch to a visible tab
+                        if ($el.parent().hasClass('active')) {
+                            console.log("  - Active tab is being hidden, need to switch");
+                            // We'll switch to the first visible tab after finishing hiding
+                        }
+                    } else {
+                        // It's a control container, hide it directly
+                        console.log("  - Hiding container:", $el.attr('id') || '');
+                        $el.hide();
+                    }
+                });
+                
+                // If current tab is hidden, switch to first visible tab
+                setTimeout(function() {
+                    var $hiddenActiveTabs = $('.nav-item.active:hidden a[data-value]');
+                    if ($hiddenActiveTabs.length > 0) {
+                        console.log("Found hidden active tabs, switching...");
+                        // Find first visible tab and click it
+                        var $visibleTabs = $('.nav-item:visible a[data-value]');
+                        if ($visibleTabs.length > 0) {
+                            console.log("  - Clicking on first visible tab:", $visibleTabs.first().attr('data-value'));
+                            $visibleTabs.first().click();
+                        }
+                    }
+                    
+                    // Make sure the top-level navigation for GAC Fitted Data is also hidden in IEX mode
+                    if (message.addClass === 'iex-mode') {
+                        $('#top_level_nav li a[data-value="GAC Fitted Data"]').parent().hide();
+                    } else {
+                        $('#top_level_nav li a[data-value="GAC Fitted Data"]').parent().show();
+                    }
+                }, 100); // Small delay to ensure DOM updates are applied
+            });
+
+            // Fallback & more reliable listener: react to Shiny input change events
+            // This ensures mode switching works even if the native change event above fails.
+            $(document).on('shiny:inputchanged', function(ev){
+                if(ev.name === 'model_mode'){
+                    var mode = ev.value;
+                    console.log('shiny:inputchanged detected for model_mode:', mode);
+                    $('body').removeClass('gac-mode iex-mode').addClass(mode.toLowerCase() + '-mode');
+                    // Re-trigger existing server listener if needed
+                    Shiny.setInputValue('model_mode_changed', mode + '_' + new Date().getTime());
+                }
+            });
+        });
         """)
     ),
-
-    # EPA banner
-    ui.HTML(epa_banner_html),
 
     # Main page title
     ui.div(
@@ -701,8 +839,8 @@ app_ui = ui.page_fluid(
 
     ui.page_navbar(
         ui.nav_panel("Input",
-            ui.layout_sidebar(
-                ui.sidebar(
+            ui.row(
+                ui.column(3, 
                     # MODE SELECTOR - New addition for combined app
                     ui.div(
                         ui.h4("Model Selection", style="margin-top: 0;"),
@@ -710,7 +848,8 @@ app_ui = ui.page_fluid(
                             "model_mode", "Choose Model Type:",
                             choices={"GAC": "Granular Activated Carbon (GAC)", "IEX": "Ion Exchange (IEX)"},
                             selected="GAC",
-                            inline=False
+                            inline=False,
+                            width="100%"
                         ),
                         class_="mode-selector"
                     ),
@@ -725,83 +864,98 @@ app_ui = ui.page_fluid(
                         ui.h4("GAC Fouling Parameters"),
                         ui.input_select("gac_WFouling", "Water Type", choices=W_FOULING_VECTOR),
                         ui.input_select("gac_CFouling", "Chemical Type", choices=C_FOULING_VECTOR),
-                        id="gac_fouling_controls"
+                        id="gac_fouling_controls",
+                        class_="gac-only"
                     ),
                     
                     # IEX-specific controls  
                     ui.div(
                         ui.input_select("iex_model", "IEX Model Selection", choices=MODEL_VECTOR),
                         id="iex_model_controls",
-                        style="display: none;"
+                        class_="iex-only"
                     ),
                     
                     ui.hr(),
                     
-                    # Collocation points (shared but with mode-specific IDs)
-                    ui.div(
-                        ui.input_slider("gac_nrv", "GAC Radial Collocation Points", 3, 18, 7),
-                        ui.input_slider("gac_nzv", "GAC Axial Collocation Points", 3, 18, 12),
-                        id="gac_collocation_controls"
-                    ),
-                    
-                    ui.div(
-                        ui.input_slider("iex_nrv", "IEX Radial Collocation Points", 3, 18, 7),
-                        ui.input_slider("iex_nzv", "IEX Axial Collocation Points", 3, 18, 13),
-                        id="iex_collocation_controls",
-                        style="display: none;"
-                    ),
+                    # Shared Collocation points
+                    ui.h4("Collocation Parameters"),
+                    ui.input_slider("nrv", "Radial Collocation Points", 3, 18, 7),
+                    ui.input_slider("nzv", "Axial Collocation Points", 3, 18, 12),
                     
                     ui.hr(),
                     ui.input_action_button("run_button", "Run Analysis", class_="btn-primary"),
                 ),
                 
                 # Main content area with mode-specific tabs
-                ui.panel_absolute(
+                ui.column(9, 
                     ui.navset_card_tab(
-                        # GAC-specific tabs
-                        ui.nav_panel("GAC Column Parameters",
+                        # Combined Column Parameters tab
+                        ui.nav_panel(
+                            "Column Parameters",
+                            # GAC Media Characteristics
                             ui.div(
-                                ui.h4(ui.strong("Media Characteristics")),
+                                ui.h4(ui.strong("Media/Resin Characteristics")),
                                 ui.row(
-                                    ui.column(4, ui.input_numeric("gac_prv", "Particle Radius", 0.0513)),
+                                    ui.column(4, ui.input_numeric("gac_prv", "Particle/Bead Radius", 0.0513)),
                                     ui.column(4, ui.input_select("gac_prunits", "Units", ["cm", "m", "mm", "in", "ft"])),
                                 ),
                                 ui.row(
                                     ui.column(4, ui.input_numeric("gac_EPORv", "Bed Porosity", 0.641)),
                                 ),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_pdv", "Particle Density", 0.803)),
-                                    ui.column(4, ui.input_select("gac_pdunits", "Units", ["g/ml"])),
+                                # GAC-specific characteristics
+                                ui.div(
+                                    ui.row(
+                                        ui.column(4, ui.input_numeric("gac_pdv", "Particle Density", 0.803)),
+                                        ui.column(4, ui.input_select("gac_pdunits", "Units", ["g/ml"])),
+                                    ),
+                                    ui.row(
+                                        ui.column(4, ui.input_numeric("gac_adv", "Apparent Density", 0.5)),
+                                        ui.column(4, ui.input_select("gac_adunits", "Units", ["g/ml"])),
+                                    ),
+                                    ui.row(
+                                        ui.column(4, ui.input_numeric("gac_psdfrv", "PSDFR", 5.0)),
+                                    ),
+                                    id="gac_media_chars",
+                                    class_="gac-only"
                                 ),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_adv", "Apparent Density", 0.5)),
-                                    ui.column(4, ui.input_select("gac_adunits", "Units", ["g/ml"])),
+                                # IEX-specific resin characteristics
+                                ui.div(
+                                    ui.row(
+                                        ui.column(4, ui.input_numeric("iex_Qv", "Resin Capacity (meq/L)", 1400)),
+                                    ),
+                                    ui.row(
+                                        ui.column(4, ui.input_numeric("iex_EPORv", "Bead Porosity (PSDM)", 0.2)),
+                                    ),
+                                    id="iex_resin_chars",
+                                    class_="iex-only"
                                 ),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_psdfrv", "PSDFR", 5.0)),
-                                ),
-                                ui.hr(),
-                                ui.h4(ui.strong("Column Specifications")),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_Lv", "Length", 8.0)),
-                                    ui.column(4, ui.input_select("gac_LengthUnits", "Units", ["cm", "ft", "m", "mm", "in"])),
-                                ),
-                                ui.row(
-                                    ui.column(8, ui.input_radio_buttons("gac_veloselect", "Flow Specification", 
-                                                                       choices=["Volumetric", "Linear"], selected="Volumetric", inline=True)),
-                                ),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_Vv", "Linear Velocity", 0.123)),
-                                    ui.column(4, ui.input_select("gac_VelocityUnits", "Units", GAC_VELOCITY_VECTOR)),
-                                ),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_Dv", "Diameter", 10.0)),
-                                    ui.column(4, ui.input_select("gac_DiameterUnits", "Units", GAC_DIAMETER_VECTOR)),
-                                ),
-                                ui.row(
-                                    ui.column(4, ui.input_numeric("gac_Fv", "Volumetric Flow Rate", 500.0)),
-                                    ui.column(4, ui.input_select("gac_FlowrateUnits", "Units", GAC_FLOWRATE_VECTOR, selected="L/min")),
-                                ),
+                            ),
+                            ui.hr(),
+                            
+                            # Column Specifications
+                            ui.h4(ui.strong("Column Specifications")),
+                            ui.row(
+                                ui.column(4, ui.input_numeric("gac_Lv", "Length", 8.0)),
+                                ui.column(4, ui.input_select("gac_LengthUnits", "Units", ["cm", "ft", "m", "mm", "in"])),
+                            ),
+                            ui.row(
+                                ui.column(8, ui.input_radio_buttons("gac_veloselect", "Flow Specification", 
+                                                                    choices=["Volumetric", "Linear"], selected="Volumetric", inline=True)),
+                            ),
+                            ui.row(
+                                ui.column(4, ui.input_numeric("gac_Vv", "Linear Velocity", 0.123)),
+                                ui.column(4, ui.input_select("gac_VelocityUnits", "Units", GAC_VELOCITY_VECTOR)),
+                            ),
+                            ui.row(
+                                ui.column(4, ui.input_numeric("gac_Dv", "Diameter", 10.0)),
+                                ui.column(4, ui.input_select("gac_DiameterUnits", "Units", GAC_DIAMETER_VECTOR)),
+                            ),
+                            ui.row(
+                                ui.column(4, ui.input_numeric("gac_Fv", "Volumetric Flow Rate", 500.0)),
+                                ui.column(4, ui.input_select("gac_FlowrateUnits", "Units", GAC_FLOWRATE_VECTOR, selected="L/min")),
+                            ),
+                            # GAC-specific column specs
+                            ui.div(
                                 ui.row(
                                     ui.column(4, ui.input_numeric("gac_wv", "Weight", 8500)),
                                     ui.column(4, ui.input_select("gac_wunits", "Units", GAC_WEIGHT_VECTOR)),
@@ -809,68 +963,57 @@ app_ui = ui.page_fluid(
                                 ui.row(
                                     ui.column(4, ui.input_numeric("gac_tortuv", "Tortuosity", 1.0)),
                                 ),
-                                ui.hr(),
-                                ui.h4(ui.strong("Data Units")),
+                                id="gac_col_specs",
+                                class_="gac-only"
+                            ),
+                            ui.hr(),
+                            
+                            # Data Units
+                            ui.h4(ui.strong("Data Units")),
+                            # GAC-specific data units
+                            ui.div(
                                 ui.row(
                                     ui.column(4, ui.input_select("gac_conc_units", "Concentration Units", ["ug", "ng", "mg"])),
                                 ),
                                 ui.row(
-                                    ui.column(4, ui.input_select("gac_tunits2", "Time Units", ["days", "hours"])),
+                                    ui.column(4, ui.input_select("gac_tunits2", "GAC Time Units", ["days", "hours"])),
                                 ),
-                                id="gac_column_params"
+                                id="gac_data_units",
+                                class_="gac-only"
                             ),
+                            # IEX-specific data units
+                            ui.div(
+                                ui.row(
+                                    ui.column(4, ui.input_select("iex_timeunits2", "Time Units", ["hr", "day"])),
+                                ),
+                                id="iex_data_units",
+                                class_="iex-only"
+                            )
                         ),
                         
-                        ui.nav_panel("GAC Compounds",
+                        ui.nav_panel(
+                            "GAC Compounds",
                             ui.div(
                                 ui.h4("Compound Properties"), ui.output_data_frame("gac_properties_table"),
                                 ui.h4("K Data"), ui.output_data_frame("gac_kdata_table"),
                                 ui.h4("Influent Data"), ui.output_data_frame("gac_influent_table"),
                                 ui.h4("Effluent Data"), ui.output_data_frame("gac_effluent_table"),
-                                id="gac_compounds"
+                                class_="gac-only"
                             )
                         ),
                         
-                        # IEX-specific tabs
-                        ui.nav_panel("IEX Column Parameters",
-                            ui.div(
-                                ui.h4(ui.strong("Resin Characteristics")),
-                                ui.row(ui.column(4, ui.input_numeric("iex_Qv", "Resin Capacity (meq/L)", 1400)),
-                                       ui.column(4, ui.input_numeric("iex_rbv", "Bead Radius", 0.03375)),
-                                       ui.column(4, ui.input_select("iex_rbunits", "Units", ["cm", "m", "mm", "in", "ft"]))),
-                                ui.row(ui.column(4, ui.input_numeric("iex_EBEDv", "Bed Porosity", 0.35)),
-                                       ui.column(4, ui.input_numeric("iex_EPORv", "Bead Porosity (PSDM)", 0.2))),
-                                ui.hr(),
-                                ui.h4(ui.strong("Column Specifications")),
-                                ui.input_radio_buttons("iex_veloselect", "Flow Specification", 
-                                                       ["Linear", "Volumetric"], selected="Linear", inline=True),
-                                ui.row(ui.column(4, ui.input_numeric("iex_Lv", "Length", 14.765)),
-                                       ui.column(4, ui.input_select("iex_LengthUnits", "Units", ["cm", "m", "mm", "in", "ft"]))),
-                                ui.row(ui.column(4, ui.input_numeric("iex_Vv", "Velocity", 0.123)),
-                                       ui.column(4, ui.input_select("iex_VelocityUnits", "Units", list(IEX_VELOCITY_CONV.keys())))),
-                                ui.row(ui.column(4, ui.input_numeric("iex_Dv", "Diameter", 4.0)),
-                                       ui.column(4, ui.input_select("iex_DiameterUnits", "Units", ["cm", "m", "in", "ft"]))),
-                                ui.row(ui.column(4, ui.input_numeric("iex_Fv", "Flow Rate", 1.546)),
-                                       ui.column(4, ui.input_select("iex_FlowrateUnits", "Units", list(IEX_VOLUMETRIC_CONV.keys())))),
-                                ui.hr(),
-                                ui.h4(ui.strong("Concentration Time")),
-                                ui.row(ui.column(4, ui.input_select("iex_timeunits2", "Units", ["hr", "day"]))),
-                                id="iex_column_params",
-                                style="display: none;"
-                            ),
-                        ),
-                        
-                        ui.nav_panel("IEX Ions & Concentrations",
+                        ui.nav_panel(
+                            "IEX Ions & Concentrations",
                             ui.div(
                                 ui.h4("Ion List"), ui.output_data_frame("iex_ion_table"),
                                 ui.h4("Influent Concentration Points"), ui.output_data_frame("iex_cin_table"),
                                 ui.h4("Effluent Concentration Points"), ui.output_data_frame("iex_effluent_table"),
-                                id="iex_ions",
-                                style="display: none;"
-                            ),
+                                class_="iex-only"
+                            )
                         ),
                         
-                        ui.nav_panel("Alkalinity Calculator",
+                        ui.nav_panel(
+                            "Alkalinity Calculator",
                             ui.div(
                                 ui.h4("Bicarbonate Concentration of Alkalinity"),
                                 ui.p("This calculator can be used to find bicarbonate concentrations from pH measurements."),
@@ -886,38 +1029,38 @@ app_ui = ui.page_fluid(
                                 ui.h5("Bicarbonate Concentration (meq/L)"), ui.output_text("bicarb_meq_L"),
                                 ui.h5("Bicarbonate Concentration (mg C/L)"), ui.output_text("bicarb_mg_C_L"),
                                 ui.h5("Bicarbonate Concentration (mg HCO3-/L)"), ui.output_text("bicarb_mg_HCO3_L"),
-                                id="alkalinity_calc",
-                                style="display: none;"
-                            ),
+                                class_="iex-only"
+                            )
                         ),
                         
-                        ui.nav_panel("kL Guesser",
+                        ui.nav_panel(
+                            "kL Guesser",
                             ui.div(
                                 ui.h4("Film Transfer Coefficient (kL) Estimator"),
                                 ui.p("Estimate kL values for common PFAS compounds using the Gnielinski equation."),
                                 ui.hr(),
                                 ui.row(
                                     ui.column(4, ui.input_numeric("temp", "Temperature", 23)),
-                                    ui.column(4, ui.input_select("tempunits", "Units", ["deg C"])),
+                                    ui.column(4, ui.input_select("tempunits", "Units", ["deg C"]))
                                 ),
                                 ui.input_action_button('estimate_kl', 'Estimate Values', class_="btn-info"),
                                 ui.hr(),
                                 ui.row(
                                     ui.column(6, ui.h5("PFAS Properties"), ui.output_data_frame("pfas_properties_table")),
-                                    ui.column(6, ui.h5("kL Estimates"), ui.output_data_frame("kl_estimates_table")),
+                                    ui.column(6, ui.h5("kL Estimates"), ui.output_data_frame("kl_estimates_table"))
                                 ),
-                                id="kl_guesser",
-                                style="display: none;"
-                            ),
-                        )
+                                class_="gac-only"
+                            )
+                        ),
+                        id="main_tabs"
                     )
                 )
             )
         ),
         
         ui.nav_panel("Output",
-            ui.layout_sidebar(
-                ui.sidebar(
+            ui.row(
+                ui.column(3,
                     ui.input_select("OCunits", "Output Concentration Units", 
                                    choices=["ug/L", "mg/L", "ng/L", "c/c0"]),
                     ui.input_select("timeunits", "Output Time Units", 
@@ -935,13 +1078,12 @@ app_ui = ui.page_fluid(
                                               choices=[0.01, 0.025, 0.05], selected=0.01, inline=True),
                         ui.input_slider("pm", "Range of K values to test (± %)", 0, 50, 30, step=5),
                         ui.input_action_button('fitting', 'Fit Data', class_="btn-info"),
-                        ui.hr(),
-                        id="gac_fitting_controls"
+                        class_="gac-only"
                     ),
                     
                     ui.download_button("save_button", "Save Data", class_="btn-success"),
                 ),
-                ui.panel_absolute(
+                ui.column(9, 
                     # GAC plot
                     ui.div(
                         output_widget("gac_main_plot"),
@@ -952,27 +1094,26 @@ app_ui = ui.page_fluid(
                         output_widget("iex_plot_counterions"),
                         ui.hr(),
                         output_widget("iex_plot_other_ions"),
-                        id="iex_output_plots",
-                        style="display: none;"
+                        id="iex_output_plots"
                     )
                 )
             )
         ),
         
-        ui.nav_panel("GAC Fitted Data",
+        ui.nav_panel(
+            "GAC Fitted Data",
             ui.div(
-                ui.div(
-                    ui.h4("Fitted K Data"),
-                    ui.output_data_frame("gac_fitted_k_data_output"),
-                    ui.hr(),
-                    ui.input_action_button('use_fit_data', 'Use Fitted K Data', class_="btn-warning"),
-                    ui.p(ui.em("Note: This will update the K Data. The model must be run again to see the new output.")),
-                    id="gac_fitted_data_content"
-                ),
+                ui.h4("Fitted K Data"),
+                ui.output_data_frame("gac_fitted_k_data_output"),
+                ui.hr(),
+                ui.input_action_button('use_fit_data', 'Use Fitted K Data', class_="btn-warning"),
+                ui.p(ui.em("Note: This will update the K Data. The model must be run again to see the new output.")),
+                class_="gac-only"
             )
         ),
         
-        ui.nav_panel("About",
+        ui.nav_panel(
+            "About",
             ui.h5("About the Combined GAC & Ion Exchange Model"),
             ui.p("This combined model provides both Granular Activated Carbon (GAC) and Ion Exchange (IEX) modeling capabilities. "
                  "Use the mode selector on the Input tab to switch between GAC and IEX functionality."),
@@ -982,10 +1123,11 @@ app_ui = ui.page_fluid(
             ui.p("Models ion exchange processes using HSDM (Homogeneous Surface Diffusion Model) or PSDM approaches."),
             ui.h5("Developed By"),
             ui.p("Original R Models: David Colantonio, Levi Haupert, Jonathan Burkhardt, Cole Sandlin"),
-            ui.p("Python Translation & Combination: Combined App Development Team"),
+            ui.p("Python Translation & Combination: Combined App Development Team")
         ),
         
         title="Combined GAC & Ion Exchange Model",
+        id="top_level_nav" # Add ID to the main navbar
     )
 )
 
@@ -999,27 +1141,96 @@ def server(input, output, session):
     gac_fitted_k_data = reactive.Value(pd.DataFrame())
     
     # --- Mode-specific UI visibility control ---
+    # We need to track the current mode to avoid redundant updates
+    current_mode = reactive.Value("GAC")  # Default mode
+    
+    # Add a separate reactive event listener for mode changes from JavaScript
     @reactive.Effect
-    def update_ui_visibility():
-        mode = input.model_mode()
+    @reactive.event(input.model_mode_changed)
+    def _handle_direct_mode_change():
+        # Extract mode from the input value (removes timestamp)
+        if input.model_mode_changed() and "_" in input.model_mode_changed():
+            new_mode = input.model_mode_changed().split("_")[0]
+            print(f"Received direct mode change: {new_mode}")
+            if new_mode in ["GAC", "IEX"] and new_mode != current_mode():
+                # Update the mode radio buttons to match
+                ui.update_radio_buttons("model_mode", selected=new_mode)
+                current_mode.set(new_mode)
+                # Force UI update without waiting for the radio button event
+                _update_ui_for_mode(new_mode)
+    
+    def _update_ui_for_mode(mode):
+        """Update the UI for the specified mode."""
+        print(f"Updating UI for mode: {mode}")
+        # Add class to body to control CSS visibility
+        session.send_custom_message("update_body_class", {"addClass": f"{mode.lower()}-mode"})
         
-        # JavaScript to show/hide elements based on mode
+        # Control visibility of specific UI elements
         if mode == "GAC":
             # Show GAC elements, hide IEX elements
-            session.send_custom_message("toggle_elements", {
-                "show": ["gac_fouling_controls", "gac_collocation_controls", "gac_column_params", 
-                        "gac_compounds", "gac_output_plot", "gac_fitting_controls", "gac_fitted_data_content"],
-                "hide": ["iex_model_controls", "iex_collocation_controls", "iex_column_params", 
-                        "iex_ions", "alkalinity_calc", "kl_guesser", "iex_output_plots"]
-            })
+            show_selectors = [
+                "#gac_fouling_controls",
+                "#gac_media_chars",
+                "#gac_col_specs",
+                "#gac_data_units",
+                ".nav-item a[data-value='GAC Compounds']",
+                ".nav-item a[data-value='kL Guesser']",
+                ".nav-item a[data-value='GAC Fitted Data']"
+            ]
+            hide_selectors = [
+                "#iex_model_controls",
+                "#iex_resin_chars",
+                "#iex_data_units",
+                ".nav-item a[data-value='IEX Ions & Concentrations']",
+                ".nav-item a[data-value='Alkalinity Calculator']"
+            ]
         else:  # IEX mode
             # Show IEX elements, hide GAC elements
-            session.send_custom_message("toggle_elements", {
-                "show": ["iex_model_controls", "iex_collocation_controls", "iex_column_params", 
-                        "iex_ions", "alkalinity_calc", "kl_guesser", "iex_output_plots"],
-                "hide": ["gac_fouling_controls", "gac_collocation_controls", "gac_column_params", 
-                        "gac_compounds", "gac_output_plot", "gac_fitting_controls", "gac_fitted_data_content"]
-            })
+            show_selectors = [
+                "#iex_model_controls",
+                "#iex_resin_chars",
+                "#iex_data_units",
+                ".nav-item a[data-value='IEX Ions & Concentrations']",
+                ".nav-item a[data-value='Alkalinity Calculator']"
+            ]
+            hide_selectors = [
+                "#gac_fouling_controls",
+                "#gac_media_chars",
+                "#gac_col_specs",
+                "#gac_data_units",
+                ".nav-item a[data-value='GAC Compounds']",
+                ".nav-item a[data-value='kL Guesser']",
+                ".nav-item a[data-value='GAC Fitted Data']"
+            ]
+        
+        # Send message to JavaScript to update UI visibility
+        session.send_custom_message("update_tab_visibility", {
+            "show": show_selectors,
+            "hide": hide_selectors,
+            "addClass": f"{mode.lower()}-mode"
+        })
+    
+    @reactive.Effect
+    @reactive.event(input.model_mode)
+    def _update_ui_on_mode_change():
+        new_mode = input.model_mode()
+        if new_mode and new_mode != current_mode():
+            print(f"Mode changed from UI: {new_mode}")
+            current_mode.set(new_mode)
+            _update_ui_for_mode(new_mode)
+            
+    # Add an explicit initialization function that runs at startup
+    @reactive.Effect
+    def _initialize_ui_state():
+        # Set initial mode (GAC by default)
+        initial_mode = input.model_mode() if input.model_mode() else "GAC"
+        current_mode.set(initial_mode)
+        
+        # Force an update of the UI for the initial mode
+        _update_ui_for_mode(initial_mode)
+        
+        # Make sure the radio button is set correctly
+        ui.update_radio_buttons("model_mode", selected=initial_mode)
 
     # --- File Loading and Processing ---
     @reactive.Effect
@@ -1040,7 +1251,7 @@ def server(input, output, session):
         file_info = input.file1()
         if file_info:
             mode = input.model_mode()
-            process_excel_file(file_info["datapath"], file_info["name"], mode)
+            process_excel_file(file_info[0]["datapath"], file_info[0]["name"], mode)
 
     def process_excel_file(filepath, filename, mode):
         """Process Excel file based on current mode (GAC or IEX)."""
@@ -1172,7 +1383,7 @@ def server(input, output, session):
             ui.update_numeric("gac_Vv", value=get_val('v', 0.123))
         elif 'flowrate' in specs['name'].values:
             ui.update_radio_buttons("gac_veloselect", selected="Volumetric")
-            ui.update_numeric("gac_Fv", value=get_val('flowrate', 500.0))
+            ui.update_numeric("gac_Fv", value=get_val('flowrate',  500.0))
             
         # Update select inputs
         ui.update_select("gac_prunits", selected=get_unit('radius', 'cm'))
@@ -1194,6 +1405,7 @@ def server(input, output, session):
     def update_iex_ui_from_data():
         """Updates IEX UI input controls with values from the loaded Excel file."""
         if input.model_mode() != "IEX":
+           
             return
             
         data = iex_app_data.get()
@@ -1212,12 +1424,12 @@ def server(input, output, session):
         
         # Update numeric inputs
         ui.update_numeric("iex_Qv", value=get_param('Q', 1400))
-        ui.update_numeric("iex_rbv", value=get_param('rb', 0.03375))
+        ui.update_numeric("iex_rbv", value=get_param('rb',  0.03375))
         ui.update_numeric("iex_EBEDv", value=get_param('EBED', 0.35))
         ui.update_numeric("iex_EPORv", value=get_param('EPOR', 0.2))
         ui.update_numeric("iex_Lv", value=get_param('L', 14.765))
-        ui.update_numeric("iex_nrv", value=get_param('nr', 7))
-        ui.update_numeric("iex_nzv", value=get_param('nz', 13))
+        ui.update_numeric("nrv", value=get_param('nr', 7))
+        ui.update_numeric("nzv", value=get_param('nz', 13))
 
         # Update velocity/flow
         if 'v' in params['name'].values:
@@ -1286,8 +1498,8 @@ def server(input, output, session):
     @render.data_frame
     def iex_cin_table():
         data = iex_app_data.get()
-        if 'concentrations' in data:
-            return render.DataTable(data['concentrations'])
+        if 'cin' in data:
+            return render.DataTable(data['cin'])
         return render.DataTable(pd.DataFrame())
 
     @output
@@ -1299,6 +1511,7 @@ def server(input, output, session):
         return render.DataFrame()
 
     # --- Model Execution ---
+   
     gac_model_results = reactive.Value(pd.DataFrame())
     iex_model_results = reactive.Value(pd.DataFrame())
 
@@ -1317,7 +1530,7 @@ def server(input, output, session):
                     
                     # Run PSDM model (implementation needed)
                     results = run_PSDM(column_data, data.get('properties'), data.get('kdata'), 
-                                      data.get('influent'), input.gac_nrv(), input.gac_nzv())
+                                      data.get('influent'), input.nrv(), input.nzv())
                     
                     gac_model_results.set(results)
                     
@@ -1330,7 +1543,7 @@ def server(input, output, session):
                 data = iex_app_data.get()
                 if data:
                     # Prepare IEX model parameters
-                    results = model_prep(input, data.get('ions'), data.get('concentrations'), NT_REPORT)
+                    results = model_prep(input, data.get('ions'), data.get('cin'), NT_REPORT)
                     
                     iex_model_results.set(results)
                     
@@ -1388,6 +1601,7 @@ def server(input, output, session):
     def bicarb_mg_C_L():
         if input.model_mode() == "IEX":
             # Convert to mg C/L (implementation needed)
+
             return "0.000"     # Placeholder
         return ""
 
@@ -1478,7 +1692,8 @@ def server(input, output, session):
         output_unit = input.OCunits()
         if output_unit == "c/c0":
             c0_meq = cin_correct(ions_df, cin_df.iloc[[0]]).drop(columns='time').iloc[0]
-            df_long['conc'] = df_long.apply(lambda row: row['conc_meq'] / c0_meq[row['name']] if c0_meq[row['name']] != 0 else 0, axis=1)
+            df_long['conc'] = df_long.apply(lambda row: row['conc_meq'] / c0_meq[row['name'].split('_')[0], 1] 
+                                 if c0_meq[row['name'].split('_')[0], 1] != 0 else 0, axis=1)
         else: # mg/L, ug/L, ng/L
             df_mgl = df.copy()
             for name in df_mgl.columns:
@@ -1593,105 +1808,7 @@ def server(input, output, session):
             df['hours'] *= GAC_TIME_CONV.get(t_unit, 1)
         return df
 
-    # === DATA EXPORT FUNCTIONALITY ===
-    @render.download(filename=lambda: f"combined-model-output-{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx")
-    def save_button():
-        mode = input.model_mode()
-        
-        with BytesIO() as buf:
-            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                if mode == "GAC":
-                    # Save GAC data and results
-                    gac_data = gac_app_data.get()
-                    if gac_data:
-                        # Original data sheets
-                        if 'properties' in gac_data:
-                            gac_data['properties'].to_excel(writer, sheet_name="GAC_Properties", index=False)
-                        if 'kdata' in gac_data:
-                            gac_data['kdata'].to_excel(writer, sheet_name="GAC_Kdata", index=False)
-                        if 'influent' in gac_data:
-                            gac_data['influent'].to_excel(writer, sheet_name="GAC_Influent", index=False)
-                        if 'effluent' in gac_data:
-                            gac_data['effluent'].to_excel(writer, sheet_name="GAC_Effluent", index=False)
-                            
-                        # Model results
-                        results = gac_model_results.get()
-                        if not results.empty:
-                            results.to_excel(writer, sheet_name="GAC_Model_Results", index=False)
-                            
-                        # Column specifications
-                        try:
-                            column_data = prepare_gac_column_data(input)
-                            column_data.to_excel(writer, sheet_name="GAC_Column_Specs", index=False, header=False)
-                        except:
-                            pass
-                            
-                        # Fitted data if available
-                        fitted_data = gac_fitted_k_data.get()
-                        if not fitted_data.empty:
-                            fitted_data.to_excel(writer, sheet_name="GAC_Fitted_Data", index=False)
-                            
-                else:  # IEX mode
-                    # Save IEX data and results
-                    iex_data = iex_app_data.get()
-                    if iex_data:
-                        # Original data sheets
-                        if 'ions' in iex_data:
-                            iex_data['ions'].to_excel(writer, sheet_name="IEX_Ions", index=False)
-                        if 'concentrations' in iex_data:
-                            iex_data['concentrations'].to_excel(writer, sheet_name="IEX_Concentrations", index=False)
-                        if 'effluent' in iex_data:
-                            iex_data['effluent'].to_excel(writer, sheet_name="IEX_Effluent", index=False)
-                            
-                        # Model results
-                        results = iex_model_results.get()
-                        if results is not None and len(results) == 2:
-                            t_out, x_out = results
-                            # Convert to output format
-                            outlet_conc = x_out[:, -1, :, -1]
-                            ions_df = iex_data.get('ions', pd.DataFrame())
-                            if not ions_df.empty:
-                                output_df = pd.DataFrame(outlet_conc, columns=ions_df['name'])
-                                output_df.insert(0, "time_hours", t_out)
-                                output_df.to_excel(writer, sheet_name="IEX_Model_Results", index=False)
-                        
-                        # PFAS properties if available
-                        pfas_data = pfas_properties()
-                        if not pfas_data.empty:
-                            pfas_data.to_excel(writer, sheet_name="PFAS_Properties", index=False)
-                            
-                        # kL estimates if available
-                        kl_data = kl_estimates()
-                        if not kl_data.empty:
-                            kl_data.to_excel(writer, sheet_name="kL_Estimates", index=False)
-                            
-                # General info sheet
-                info_df = pd.DataFrame({
-                    'Parameter': ['Model_Mode', 'Export_Date', 'App_Version'],
-                    'Value': [mode, pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'), 'Combined GAC-IEX v1.0']
-                })
-                info_df.to_excel(writer, sheet_name="Export_Info", index=False)
-                
-            yield buf.getvalue()
-
-# Add JavaScript for UI visibility control
-app_ui = ui.page_fluid(
-    app_ui,
-    ui.tags.script("""
-        $(document).ready(function() {
-            Shiny.addCustomMessageHandler('toggle_elements', function(message) {
-                // Show elements
-                message.show.forEach(function(id) {
-                    $('#' + id).show();
-                });
-                // Hide elements  
-                message.hide.forEach(function(id) {
-                    $('#' + id).hide();
-                });
-            });
-        });
-    """)
-)
+    # We've moved this functionality to the _update_ui_on_mode_change function
 
 # Create and run the app
 app = App(app_ui, server)
